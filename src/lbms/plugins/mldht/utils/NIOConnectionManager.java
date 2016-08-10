@@ -16,6 +16,9 @@
  */
 package lbms.plugins.mldht.utils;
 
+import lbms.plugins.mldht.kad.DHT;
+import lbms.plugins.mldht.kad.DHT.LogLevel;
+
 import java.io.IOException;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
@@ -26,9 +29,6 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicReference;
-
-import lbms.plugins.mldht.kad.DHT;
-import lbms.plugins.mldht.kad.DHT.LogLevel;
 
 public class NIOConnectionManager {
 	
@@ -126,7 +126,8 @@ public class NIOConnectionManager {
 		while((toRegister = registrations.poll()) != null)
 		{
 			connections.add(toRegister);
-			toRegister.registrationEvent(NIOConnectionManager.this,toRegister.getChannel().register(selector, toRegister.calcInterestOps(),toRegister));
+			toRegister.registrationEvent(NIOConnectionManager.this,
+				toRegister.getChannel().register(selector, toRegister.calcInterestOps(),toRegister));
 		}
 	}
 	

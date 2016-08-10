@@ -1,5 +1,8 @@
 package lbms.plugins.mldht.kad;
 
+import lbms.plugins.mldht.kad.utils.AddressUtils;
+import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
+
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.NetworkInterface;
@@ -12,9 +15,6 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
-
-import lbms.plugins.mldht.kad.utils.AddressUtils;
-import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
 
 public class RPCServerManager {
 	
@@ -134,8 +134,8 @@ public class RPCServerManager {
 		RPCServer srv = new RPCServer(this,addr,dht.config.getListeningPort(), dht.serverStats);
 		// doing the socket setup takes time, do it in the background
 		onServerRegistration.forEach(c -> c.accept(srv));
-		dht.getScheduler().execute(srv::start);
 		interfacesInUse.put(addr, srv);
+		dht.getScheduler().execute(srv::start);
 	}
 	
 	List<Consumer<RPCServer>> onServerRegistration = new CopyOnWriteArrayList<>();

@@ -16,12 +16,6 @@
  */
 package lbms.plugins.mldht.kad;
 
-import static the8472.bencode.Utils.prettyPrint;
-import static the8472.utils.Functional.typedGet;
-
-import the8472.bencode.Tokenizer.BDecodingException;
-import the8472.bencode.Utils;
-
 import lbms.plugins.mldht.kad.DHT.LogLevel;
 import lbms.plugins.mldht.kad.messages.ErrorMessage;
 import lbms.plugins.mldht.kad.messages.ErrorMessage.ErrorCode;
@@ -39,6 +33,8 @@ import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
 import lbms.plugins.mldht.utils.ExponentialWeightendMovingAverage;
 import lbms.plugins.mldht.utils.NIOConnectionManager;
 import lbms.plugins.mldht.utils.Selectable;
+import the8472.bencode.Tokenizer.BDecodingException;
+import the8472.bencode.Utils;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -64,6 +60,9 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+
+import static the8472.bencode.Utils.prettyPrint;
+import static the8472.utils.Functional.typedGet;
 
 /**
  * @author The_8472, Damokles

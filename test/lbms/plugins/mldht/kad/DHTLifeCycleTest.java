@@ -1,15 +1,9 @@
 package lbms.plugins.mldht.kad;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertFalse;
-import static org.junit.Assert.assertTrue;
-
 import lbms.plugins.mldht.DHTConfiguration;
-import lbms.plugins.mldht.kad.DHT;
-import lbms.plugins.mldht.kad.DHTLogger;
 import lbms.plugins.mldht.kad.DHT.DHTtype;
 import lbms.plugins.mldht.kad.DHT.LogLevel;
-import lbms.plugins.mldht.kad.DHTStatus;
+import org.junit.Test;
 
 import java.lang.Thread.UncaughtExceptionHandler;
 import java.net.UnknownHostException;
@@ -19,9 +13,11 @@ import java.nio.file.Paths;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
-import org.junit.Test;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
 
 public class DHTLifeCycleTest {
 	
@@ -36,8 +32,8 @@ public class DHTLifeCycleTest {
 	 */
 	@Test
 	public void testStartup() throws Exception {
-		int port = ThreadLocalRandom.current().nextInt(1024, 65535);
-		
+		int port = 12345;
+
 		CompletableFuture<Boolean> exceptionCanary = new CompletableFuture<>();
 		
 		ScheduledThreadPoolExecutor scheduler = new ScheduledThreadPoolExecutor(1, new ThreadFactory() {
@@ -145,8 +141,9 @@ public class DHTLifeCycleTest {
 		exceptionCanary.get();
 		
 		assertFalse("should not create storage path, that's the caller's duty", Files.isDirectory(storagePath));
-		
-		
+
+		dhtInstance.stop();
+
 	}
 
 }
