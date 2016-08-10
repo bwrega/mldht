@@ -3,10 +3,10 @@
 	<groupId>mldht.core</groupId>
 	<artifactId>libmldht</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name>mldht - Bittorrent Mainline DHT library</name>
+	<name>mldht - Bittorrent Mainline DHT library - bwbranch</name>
 	<packaging>jar</packaging>
 	<scm>
-		<connection>scm:git:https://github.com/the8472/mldht.git</connection>
+		<connection>scm:git:git@github.com:bwrega/mldht.git</connection>
 		<url>https://github.com/the8472/mldht</url>
 	</scm>
 	<properties>
