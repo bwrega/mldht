@@ -1,3 +1,4 @@
 [submodule "ed25519-java"]
 	path = ed25519-java
 	url = git@github.com:bwrega/ed25519-java.git
+	branch = bwbranch
