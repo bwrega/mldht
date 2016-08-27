@@ -16,9 +16,6 @@
  */
 package lbms.plugins.mldht.kad;
 
-import static the8472.bencode.Utils.prettyPrint;
-import static the8472.utils.Functional.awaitAll;
-
 import lbms.plugins.mldht.DHTConfiguration;
 import lbms.plugins.mldht.kad.GenericStorage.StorageItem;
 import lbms.plugins.mldht.kad.GenericStorage.UpdateResult;
@@ -83,6 +80,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+
+import static the8472.bencode.Utils.prettyPrint;
+import static the8472.utils.Functional.awaitAll;
 
 /**
  * @author Damokles
@@ -181,14 +181,20 @@ public class DHT implements DHTBase {
 	RPCStats								serverStats;
 
 	private final DHTtype					type;
+	private final Key nodeBaseKey;
 	private List<ScheduledFuture<?>>		scheduledActions = new ArrayList<>();
 	private List<DHT>						siblingGroup = new ArrayList<>();
 	private ScheduledExecutorService		scheduler;
 	
 
 	public DHT(DHTtype type) {
+		this(type, null);
+	}
+
+	public DHT(DHTtype type, Key nodeBaseKey) {
 		this.type = type;
-		
+		this.nodeBaseKey = nodeBaseKey;
+
 		siblingGroup.add(this);
 		stats = new DHTStats();
 		status = DHTStatus.Stopped;
@@ -690,7 +696,7 @@ public class DHT implements DHTBase {
 		
 		populate();
 		
-		node.initKey(config);
+		node.initKey(config, nodeBaseKey);
 		node.loadTable(table_file);
 		
 

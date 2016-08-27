@@ -277,10 +277,10 @@ public class Node {
 	 * @param srv
 	 */
 	public Node(DHT dht) {
-		this.dht = dht;
-		num_receives = 0;
-		num_entries = 0;
-	}
+			this.dht = dht;
+			num_receives = 0;
+			num_entries = 0;
+		}
 
 	/**
 	 * An RPC message was received, the node must now update the right bucket.
@@ -924,13 +924,20 @@ public class Node {
 		};
 
 	}
-	
+
+	void initKey(DHTConfiguration config, Key baseKey) {
+		if (baseKey == null)
+			initKey(config);
+		else
+			this.baseKey = baseKey;
+	}
+
 	void initKey(DHTConfiguration config)
 	{
 		if(config != null && config.isPersistingID()) {
 			Path keyPath = config.getStoragePath().resolve("baseID.config");
 			File keyFile = keyPath.toFile();
-			
+
 			if (keyFile.exists() && keyFile.isFile()) {
 				try {
 					List<String> raw = Files.readAllLines(keyPath);
@@ -941,12 +948,12 @@ public class Node {
 				}
 			}
 		}
-		
+
 		baseKey = Key.createRandomKey();
-		
+
 		persistKey();
 	}
-	
+
 	void persistKey() {
 		DHTConfiguration config = dht.getConfig();
 		
