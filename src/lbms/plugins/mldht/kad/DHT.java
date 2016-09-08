@@ -939,7 +939,7 @@ public class DHT implements DHTBase {
 		List<InetSocketAddress> nodeAddresses =  new ArrayList<>();
 		
 		try {
-			for(InetSocketAddress unres : DHTConstants.UNRESOLVED_BOOTSTRAP_NODES) {
+			for(InetSocketAddress unres : config.getUnresolvedBootstrapNodes()) {
 				for(InetAddress addr : InetAddress.getAllByName(unres.getHostString())) {
 					if(type.canUseAddress(addr))
 						nodeAddresses.add(new InetSocketAddress(addr, unres.getPort()));

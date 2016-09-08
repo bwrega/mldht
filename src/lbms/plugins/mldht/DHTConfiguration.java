@@ -16,6 +16,7 @@
  */
 package lbms.plugins.mldht;
 
+import java.net.InetSocketAddress;
 import java.nio.file.Path;
 
 public interface DHTConfiguration {
@@ -29,6 +30,14 @@ public interface DHTConfiguration {
 	public boolean noRouterBootstrap();
 	
 	public boolean allowMultiHoming();
-	
-	
+
+	default InetSocketAddress[] getUnresolvedBootstrapNodes() {
+		return new InetSocketAddress[]{
+			InetSocketAddress.createUnresolved("dht.transmissionbt.com", 6881),
+			InetSocketAddress.createUnresolved("router.bittorrent.com", 6881),
+			InetSocketAddress.createUnresolved("router.utorrent.com", 6881),
+			InetSocketAddress.createUnresolved("router.silotis.us", 6881),
+		};
+	}
+
 }
