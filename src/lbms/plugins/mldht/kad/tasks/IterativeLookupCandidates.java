@@ -8,6 +8,7 @@ import lbms.plugins.mldht.kad.Key;
 import lbms.plugins.mldht.kad.NonReachableCache;
 import lbms.plugins.mldht.kad.RPCCall;
 import lbms.plugins.mldht.kad.RPCState;
+import lbms.plugins.mldht.kad.SpamThrottle;
 
 import java.net.InetAddress;
 import java.util.Collection;
@@ -21,6 +22,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -53,10 +55,13 @@ public class IterativeLookupCandidates {
 	Map<KBucketEntry, LookupGraphNode> candidates = new ConcurrentHashMap<>();
 	// maybe split out call tracking
 	Map<RPCCall, KBucketEntry> calls;
+	Map<InetAddress, Set<RPCCall>> callsByIp;
 	Collection<Object> accepted;
 	boolean allowRetransmits = true;
 	IDMismatchDetector detector;
-	private NonReachableCache nonReachableCache;
+	NonReachableCache nonReachableCache;
+	SpamThrottle throttle;
+	
 	
 	class LookupGraphNode {
 		final KBucketEntry e;
@@ -65,7 +70,10 @@ public class IterativeLookupCandidates {
 		List<RPCCall> calls = new CopyOnWriteArrayList<>();
 		boolean tainted;
 		boolean acceptedResponse;
+		boolean root;
 		int previouslyFailedCount;
+		boolean unreachable;
+		boolean throttled;
 		
 		public LookupGraphNode(KBucketEntry kbe) {
 			e = kbe;
@@ -126,6 +134,7 @@ public class IterativeLookupCandidates {
 	public IterativeLookupCandidates(Key target, IDMismatchDetector detector) {
 		this.target = target;
 		calls = new ConcurrentHashMap<>();
+		callsByIp = new ConcurrentHashMap<>();
 		candidates = new ConcurrentHashMap<>();
 		accepted = new HashSet<>();
 		this.detector = detector;
@@ -134,15 +143,23 @@ public class IterativeLookupCandidates {
 	public void setNonReachableCache(NonReachableCache nonReachableCache) {
 		this.nonReachableCache = nonReachableCache;
 	}
+	
+	public void setSpamThrottle(SpamThrottle throttle) {
+		this.throttle = throttle;
+	}
 
 	void allowRetransmits(boolean toggle) {
 		allowRetransmits = toggle;
 	}
 	
 	void addCall(RPCCall c, KBucketEntry kbe) {
-		synchronized (this) {
-			calls.put(c, kbe);
+		calls.put(c, kbe);
+		Set<RPCCall> byIp = callsByIp.computeIfAbsent(c.getRequest().getDestination().getAddress(), k -> new HashSet<>());
+		
+		synchronized (byIp) {
+			byIp.add(c);
 		}
+		
 		
 		candidates.get(kbe).addCall(c);
 	}
@@ -182,11 +199,18 @@ public class IterativeLookupCandidates {
 			LookupGraphNode newNode = candidates.compute(e, (kbe, node) -> {
 				if(node == null) {
 					node = new LookupGraphNode(kbe);
+					node.root = source == null;
 					node.tainted = detector.isIdInconsistencyExpected(kbe.getAddress(), kbe.getID());
 					if(nonReachableCache != null) {
 						int failures = nonReachableCache.getFailures(kbe.getAddress());
-						// 5% chance we ignore failure counts;
-						node.previouslyFailedCount = ThreadLocalRandom.current().nextFloat() < 0.05 ? 0 : failures;
+						node.previouslyFailedCount = failures;
+						// 0-20
+						int rnd = ThreadLocalRandom.current().nextInt(21);
+						// -2 - 19 -> 5% chance to let even the worst stuff still through to keep the counters going up
+						node.unreachable = Math.min(failures - 2, 19) > rnd;
+					}
+					if(throttle != null) {
+						node.throttled = throttle.test(kbe.getAddress().getAddress());
 					}
 				}
 				if(sourceNode != null)
@@ -207,68 +231,98 @@ public class IterativeLookupCandidates {
 		return candidates.get(e).sources.stream().map(LookupGraphNode::toKbe).collect(Collectors.toSet());
 	}
 	
-	Comparator<Map.Entry<KBucketEntry, LookupGraphNode>> comp() {
+	Comparator<LookupGraphNode> comp() {
 		Comparator<KBucketEntry> d = new KBucketEntry.DistanceOrder(target);
-		Comparator<LookupGraphNode> s = (a, b) -> b.returnedNodes.size() - a.returnedNodes.size();
-		return Map.Entry.<KBucketEntry, LookupGraphNode>comparingByKey(d).thenComparing(Map.Entry.comparingByValue(s));
+		Comparator<LookupGraphNode> s = (a, b) -> b.sources.size() - a.sources.size();
+		return Comparator.<LookupGraphNode, KBucketEntry>comparing(n -> n.e, d).thenComparing(s);
 	}
 	
 	Optional<KBucketEntry> next() {
 		synchronized (this) {
-			return cand().min(comp()).map(Map.Entry::getKey);
+			return allCand().sorted(comp()).filter(lookupFilter).findFirst().map(LookupGraphNode::toKbe);
 		}
 	}
 	
-	Stream<Map.Entry<KBucketEntry, LookupGraphNode>> cand() {
-		return candidates.entrySet().stream().filter(me -> {
-			KBucketEntry kbe = me.getKey();
-			LookupGraphNode node = me.getValue();
+	Optional<KBucketEntry> next2(Predicate<KBucketEntry> postFilter) {
+		synchronized (this) {
 			
-			if(node.tainted)
-				return false;
+			// sort + filter + findAny should be faster than filter + min in this case since findAny reduces the invocations of the filter, and that is more expensive than the sorting
+			Optional<KBucketEntry> kbe = allCand().sorted(comp()).filter(retransmitFilter(false)).filter(lookupFilter).findFirst().map(node -> node.e).filter(postFilter);
 			
-			if(node.calls.size() > 0 && !allowRetransmits)
-				return false;
+			if(!kbe.isPresent() && allowRetransmits)
+				kbe = allCand().sorted(comp()).filter(lookupFilter).filter(retransmitFilter(true)).findFirst().map(node -> node.e).filter(postFilter);
 			
-			InetAddress addr = kbe.getAddress().getAddress();
-			
-			if(accepted.contains(addr) || accepted.contains(kbe.getID()))
-				return false;
-
-			// only do requests to nodes which have at least one source where the source has not given us lots of bogus candidates
-			if(node.sources.size() > 0 && node.sources.stream().noneMatch(source -> source.nonSuccessfulDescendantCalls() < 3))
-				return false;
-			
-			int dups = 0;
-			
-			// also check other calls based on matching IP instead of strictly matching ip+port+id
-			for(RPCCall c : calls.keySet()) {
-				if(!addr.equals(c.getRequest().getDestination().getAddress()))
-					continue;
-				
-				// in flight, not stalled
-				if(c.state() == RPCState.SENT || c.state() == RPCState.UNSENT)
-					return false;
-				
-				// already got a response from that addr that does not match what we would expect from this candidate anyway
-				if(c.state() == RPCState.RESPONDED && !c.getResponse().getID().equals(me.getKey().getID()))
-					return false;
-				// we don't strictly check the presence of IDs in error messages, so we can't compare those here
-				if(c.state() == RPCState.ERROR)
-					return false;
-				dups++;
-			}
-			// log2 scale
-			int sources = 31 - Integer.numberOfLeadingZeros(max(me.getValue().sources.size(), 1));
-			sources -= node.previouslyFailedCount;
-			//System.out.println("sd:" + sources + " " + dups);
-			
-			return sources >= dups;
-		});
+			return kbe;
+		}
 	}
 	
-	Stream<Map.Entry<KBucketEntry, LookupGraphNode>> allCand() {
-		return candidates.entrySet().stream();
+	static Predicate<LookupGraphNode> retransmitFilter(boolean retransmits) {
+		
+		return (node) -> {
+
+			if (node.calls.size() > 0 && !retransmits)
+				return false;
+			return true;
+		};
+		
+	}
+	
+	Predicate<LookupGraphNode> lookupFilter = node -> {
+		KBucketEntry kbe = node.e;
+		
+		if(node.tainted || node.unreachable || node.throttled)
+			return false;
+		
+		// check if we can do retransmits
+		if(!allowRetransmits && !node.calls.isEmpty())
+			return false;
+
+		// skip retransmits if we previously got a response but from the wrong socket address
+		if(node.calls.stream().anyMatch(RPCCall::hasSocketMismatch))
+			return false;
+		
+		
+		InetAddress addr = kbe.getAddress().getAddress();
+		
+		if(accepted.contains(addr) || accepted.contains(kbe.getID()))
+			return false;
+
+		// only do requests to nodes which have at least one source where the source has not given us lots of bogus candidates
+		if(node.sources.size() > 0 && node.sources.stream().noneMatch(source -> source.nonSuccessfulDescendantCalls() < 3))
+			return false;
+		
+		int dups = 0;
+		
+		// also check other calls based on matching IP instead of strictly matching ip+port+id
+		Set<RPCCall> byIp = callsByIp.get(addr);
+		if(byIp != null) {
+			synchronized(byIp) {
+				for(RPCCall c : byIp) {
+					// in flight, not stalled
+					if(c.state() == RPCState.SENT || c.state() == RPCState.UNSENT)
+						return false;
+					
+					// already got a response from that addr that does not match what we would expect from this candidate anyway
+					if(c.state() == RPCState.RESPONDED && !c.getResponse().getID().equals(kbe.getID()))
+						return false;
+					// we don't strictly check the presence of IDs in error messages, so we can't compare those here
+					if(c.state() == RPCState.ERROR)
+						return false;
+					dups++;
+				}
+			}
+		}
+		// log2 scale
+		int sources = max(1, node.sources.size() + (node.root ? 1 : 0));
+		int scaledSources = 31 - Integer.numberOfLeadingZeros(sources);
+		//System.out.println("sd:" + sources + " " + dups);
+		
+		return scaledSources >= dups;
+	};
+	
+	
+	Stream<LookupGraphNode> allCand() {
+		return candidates.values().stream();
 	}
 	
 	LookupGraphNode nodeForEntry(KBucketEntry e) {

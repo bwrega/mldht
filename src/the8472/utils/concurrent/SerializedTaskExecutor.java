@@ -37,15 +37,15 @@ public class SerializedTaskExecutor {
 		return (T r) -> {
 			
 			// attempt to execute on current thread
-			if(lock.get() == false && tryRun.test(r)) {
-				// success
-			} else {
-				// execution on current thread failed, enqueue
-				q.add(r);
-				// try again in case other thread ceased draining the queue
-				if(lock.get() == false)
-					tryRun.test(null);
-			}
+			if(lock.get() == false && tryRun.test(r))
+				return;// success
+			
+			// execution on current thread failed, enqueue
+			q.add(r);
+			// try again in case other thread ceased draining the queue
+			if (lock.get() == false)
+				tryRun.test(null);
+			
 		};
 	}
 	
@@ -61,11 +61,16 @@ public class SerializedTaskExecutor {
 			if(current > 1)
 				return;
 			
-			do {
-				loopBody.run();
-				
-				current = lock.addAndGet(Math.negateExact(current));
-			} while(current > 0);
+			try {
+				do {
+					loopBody.run();
+					
+					current = lock.addAndGet(Math.negateExact(current));
+				} while(current > 0);
+			} catch(Throwable t) {
+				lock.set(0);
+				throw t;
+			}
 		};
 	}
 

@@ -21,6 +21,7 @@ import lbms.plugins.mldht.kad.messages.ErrorMessage;
 import lbms.plugins.mldht.kad.messages.ErrorMessage.ErrorCode;
 import lbms.plugins.mldht.kad.messages.FindNodeResponse;
 import lbms.plugins.mldht.kad.messages.MessageBase;
+import lbms.plugins.mldht.kad.messages.MessageBase.Method;
 import lbms.plugins.mldht.kad.messages.MessageBase.Type;
 import lbms.plugins.mldht.kad.messages.MessageDecoder;
 import lbms.plugins.mldht.kad.messages.MessageException;
@@ -35,6 +36,7 @@ import lbms.plugins.mldht.utils.NIOConnectionManager;
 import lbms.plugins.mldht.utils.Selectable;
 import the8472.bencode.Tokenizer.BDecodingException;
 import the8472.bencode.Utils;
+import the8472.utils.concurrent.SerializedTaskExecutor;
 
 import java.io.IOException;
 import java.net.InetAddress;
@@ -45,6 +47,7 @@ import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.nio.channels.SelectableChannel;
 import java.nio.channels.SelectionKey;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.Collection;
@@ -57,6 +60,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
@@ -72,7 +77,7 @@ public class RPCServer {
 	
 	private static final int MTID_LENGTH = 6;
 	
-	enum State {
+	public enum State {
 		INITIAL,
 		RUNNING,
 		STOPPED
@@ -96,6 +101,7 @@ public class RPCServer {
 	private Key										derivedId;
 	private InetSocketAddress						consensusExternalAddress;
 	private SpamThrottle 							throttle = new SpamThrottle();
+	private SpamThrottle 							requestThrottle;
 	private ExponentialWeightendMovingAverage		unverifiedLossrate = new ExponentialWeightendMovingAverage().setWeight(0.01).setValue(0.5);
 	private ExponentialWeightendMovingAverage		verifiedEntryLossrate = new ExponentialWeightendMovingAverage().setWeight(0.01).setValue(0.5);
 	
@@ -114,14 +120,14 @@ public class RPCServer {
 	private long	timeOfLastReceiveCountChange = 0;
 	
 
-	private SocketHandler sel;
+	SocketHandler sel;
 
 	public RPCServer (RPCServerManager manager, InetAddress addr, int port, RPCStats stats) {
 		this.port = port;
 		this.dh_table = manager.dht;
 		timeoutFilter = new ResponseTimeoutFilter();
 		pipeline = new ConcurrentLinkedQueue<>();
-		calls = new ConcurrentHashMap<>(80,0.75f,3);
+		calls = new ConcurrentHashMap<>(DHTConstants.MAX_ACTIVE_CALLS);
 		call_queue = new ConcurrentLinkedQueue<>();
 		this.stats = stats;
 		this.addr = addr;
@@ -165,6 +171,14 @@ public class RPCServer {
 		return derivedId;
 	}
 
+	void setOutgoingThrottle(SpamThrottle throttle) {
+		this.requestThrottle = throttle;
+	}
+
+	public SpamThrottle getRequestThrottle() {
+		return this.requestThrottle;
+	}
+
 	/*
 	 * (non-Javadoc)
 	 * 
@@ -173,10 +187,15 @@ public class RPCServer {
 	public void start() {
 		if(state != State.INITIAL)
 			throw new IllegalStateException("already initialized");
+		startTime = Instant.now();
 		state = State.RUNNING;
 		DHT.logInfo("Starting RPC Server");
 		sel.start();
-		startTime = Instant.now();
+
+	}
+
+	public State getState() {
+		return state;
 	}
 	
 	public void stop() {
@@ -203,7 +222,7 @@ public class RPCServer {
 	/* (non-Javadoc)
 	 * @see lbms.plugins.mldht.kad.RPCServerBase#doCall(lbms.plugins.mldht.kad.messages.MessageBase)
 	 */
-	public void doCall (RPCCall c) {
+	public void doCall(RPCCall c) {
 		
 		MessageBase req = c.getRequest();
 		if(req.getServer() == null)
@@ -211,21 +230,56 @@ public class RPCServer {
 		
 		enqueueEventConsumers.forEach(callback -> callback.accept(c));
 		
-		while(true)
-		{
-			
-			if(calls.size() >= DHTConstants.MAX_ACTIVE_CALLS)
-			{
-				DHT.logInfo("Queueing RPC call, no slots available at the moment");
-				call_queue.add(c);
+		call_queue.add(c);
+
+		drainTrigger.run();
+	}
+
+	Runnable drainTrigger = SerializedTaskExecutor.onceMore(this::drainQueue);
+
+	private void drainQueue() {
+
+		int capacity = DHTConstants.MAX_ACTIVE_CALLS  - calls.size();
+
+		requestThrottle.decay();
+
+		while(capacity > 0) {
+
+			RPCCall c = call_queue.poll();
+
+			if(c == null) {
+				Runnable r = awaitingDeclog.poll();
+				if(r != null) {
+					r.run();
+					continue;
+				}
 				break;
 			}
+
+			int delay = requestThrottle.calculateDelayAndAdd(c.getRequest().getDestination().getAddress());
+
+
+			if(delay > 0) {
+				delay += ThreadLocalRandom.current().nextInt(30, 50);
+				DHT.logInfo("Queueing RPCCall (+"+delay+"ms), would be spamming remote peer " + c.getExpectedID() + " " + c.knownReachableAtCreationTime() + " " +  AddressUtils.toString(c.getRequest().getDestination()) + " " + c.getRequest().toString());
+				dh_table.getScheduler().schedule(() -> {
+					call_queue.add(c);
+					drainTrigger.run();
+					requestThrottle.saturatingDec(c.getRequest().getDestination().getAddress());
+				}, delay, TimeUnit.MILLISECONDS);
+				continue;
+			}
+
 			byte[] mtid = new byte[MTID_LENGTH];
 			ThreadLocalUtils.getThreadLocalRandom().nextBytes(mtid);
+
 			if(calls.putIfAbsent(new ByteWrapper(mtid),c) == null)
 			{
+				capacity--;
 				dispatchCall(c, mtid);
-				break;
+			} else {
+				// this is very unlikely to happen
+				call_queue.add(c);
 			}
 		}
 	}
@@ -245,7 +299,7 @@ public class RPCServer {
 				unverifiedLossrate.updateAverage(1.0);
 			calls.remove(w, c);
 			dh_table.timeout(c);
-			doQueuedCalls();
+			drainTrigger.run();
 		}
 		
 		public void onStall(RPCCall c) {}
@@ -370,9 +424,11 @@ public class RPCServer {
 		} catch(MessageException e)
 		{
 			byte[] mtid = typedGet(bedata, MessageBase.TRANSACTION_KEY, byte[].class).orElse(new byte[MTID_LENGTH]);
+			Method m = typedGet(bedata, MessageBase.Type.TYPE_KEY, byte[].class).map(b -> new String(b, StandardCharsets.ISO_8859_1)).map(MessageBase.messageMethod::get).orElse(Method.UNKNOWN);
 			DHT.log(e.getMessage(), LogLevel.Debug);
-			MessageBase err = new ErrorMessage(mtid, e.errorCode.code,e.getMessage());
+			ErrorMessage err = new ErrorMessage(mtid, e.errorCode.code,e.getMessage());
 			err.setDestination(source);
+			err.setMethod(m);
 			sendMessage(err);
 			return;
 		} catch(IOException e) {
@@ -418,7 +474,7 @@ public class RPCServer {
 					msg.setAssociatedCall(c);
 					c.response(msg);
 
-					doQueuedCalls();
+					drainTrigger.run();
 					// apply after checking for a proper response
 					handleMessage(msg);
 				}
@@ -436,8 +492,16 @@ public class RPCServer {
 			// -> ignore response
 			
 			DHT.logError("mtid matched, socket address did not, ignoring message, request: " + c.getRequest().getDestination() + " -> response: " + msg.getOrigin() + " v:"+ msg.getVersion().map(Utils::prettyPrint).orElse(""));
-			
+			if(msg.getType() != MessageBase.Type.ERR_MSG && dh_table.getType() == DHT.DHTtype.IPV6_DHT) {
+				// this is more likely due to incorrect binding implementation in ipv6. notify peers about that
+				// don't bother with ipv4, there are too many complications
+				MessageBase err = new ErrorMessage(msg.getMTID(), ErrorCode.GenericError.code, "A request was sent to " + c.getRequest().getDestination() + " and a response with matching transaction id was received from " + msg.getOrigin() + " . Multihomed nodes should ensure that sockets are properly bound and responses are sent with the correct source socket address. See BEPs 32 and 45.");
+				err.setDestination(c.getRequest().getDestination());
+				sendMessage(err);
+			}
+
 			// but expect an upcoming timeout if it's really just a misbehaving node
+			c.setSocketMismatch();
 			c.injectStall();
 			
 			return;
@@ -528,6 +592,8 @@ public class RPCServer {
 	 * @see lbms.plugins.mldht.kad.RPCServerBase#sendMessage(lbms.plugins.mldht.kad.messages.MessageBase)
 	 */
 	public void sendMessage (MessageBase msg) {
+		if(msg.getDestination() == null)
+			throw new IllegalArgumentException("message destination must not be null");
 		fillPipe(new EnqueuedSend(msg, null));
 	}
 	
@@ -558,37 +624,29 @@ public class RPCServer {
 		}
 	}*/
 
-	private void doQueuedCalls () {
-		while (call_queue.peek() != null && calls.size() < DHTConstants.MAX_ACTIVE_CALLS) {
-			RPCCall c;
-
-			if((c = call_queue.poll()) == null)
-				return;
-			
-			doCall(c);
-		}
-		
-		Runnable r;
-		
-		while(calls.size() < DHTConstants.MAX_ACTIVE_CALLS && (r = awaitingDeclog.poll()) != null) {
-			r.run();
-		}
-	}
-	
 	@Override
 	public String toString() {
 		Formatter f = new Formatter();
+
 		f.format("%s\tbind: %s consensus: %s%n", getDerivedID(), getBindAddress(), consensusExternalAddress);
 		f.format("rx: %d tx: %d active: %d baseRTT: %d loss: %f  loss (verified): %f uptime: %s%n",
-				numReceived, numSent, getNumActiveRPCCalls(), timeoutFilter.getStallTimeout(), unverifiedLossrate.getAverage(), verifiedEntryLossrate.getAverage() , Duration.between(startTime, Instant.now()));
+				numReceived, numSent, getNumActiveRPCCalls(), timeoutFilter.getStallTimeout(), unverifiedLossrate.getAverage(), verifiedEntryLossrate.getAverage() , age());
 		f.format("RTT stats (%dsamples) %s", timeoutFilter.getSampleCount(), timeoutFilter.getCurrentStats());
 
 		return f.toString();
 	}
 	
+	Duration age() {
+		Instant start = startTime;
+		if(start == null)
+			return Duration.ZERO;
+		return Duration.between(start, Instant.now());
+	}
+
 	static final ThreadLocal<ByteBuffer> writeBuffer = ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(1500));
-	
-	private class SocketHandler implements Selectable {
+	static final ThreadLocal<ByteBuffer> readBuffer = ThreadLocal.withInitial(() -> ByteBuffer.allocateDirect(DHTConstants.RECEIVE_BUFFER_SIZE));
+
+	class SocketHandler implements Selectable {
 		DatagramChannel channel;
 		
 		private static final int NOT_INITIALIZED = -1;
@@ -640,10 +698,12 @@ public class RPCServer {
 				
 		}
 		
-		private final ByteBuffer readBuffer = ByteBuffer.allocateDirect(DHTConstants.RECEIVE_BUFFER_SIZE);
-		
-		private void readEvent() throws IOException {
+		void readEvent() throws IOException {
+
+			throttle.decay();
 			
+			ByteBuffer readBuffer = RPCServer.readBuffer.get();
+
 			while(true)
 			{
 				readBuffer.clear();
@@ -657,7 +717,7 @@ public class RPCServer {
 				// -> immediately discard junk on the read loop, don't even allocate a buffer for it
 				if(readBuffer.position() < 10 || readBuffer.get(0) != 'd' || soa.getPort() == 0)
 					continue;
-				if(throttle.isSpam(soa.getAddress()))
+				if(throttle.addAndTest(soa.getAddress()))
 					continue;
 				
 				// copy from the read buffer since we hand off to another thread
@@ -711,9 +771,13 @@ public class RPCServer {
 							DHT.logVerbose("sent: " + prettyPrint(es.toSend.getBase())+ " to " + es.toSend.getDestination());
 						}
 						
-						if(es.associatedCall != null)
+						if(es.associatedCall != null) {
 							es.associatedCall.sent(RPCServer.this);
-						
+							// when we send requests to a node we don't want their replies to get stuck in the filter
+							throttle.remove(es.toSend.getDestination().getAddress());
+						}
+
+
 						stats.addSentMessageToCount(es.toSend);
 						stats.addSentBytes(bytesSent + dh_table.getType().HEADER_LENGTH);
 						if(DHT.isLogLevelEnabled(LogLevel.Debug))

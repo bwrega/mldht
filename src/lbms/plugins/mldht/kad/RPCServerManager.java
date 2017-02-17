@@ -11,8 +11,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
@@ -29,6 +32,7 @@ public class RPCServerManager {
 	private ConcurrentHashMap<InetAddress,RPCServer> interfacesInUse = new ConcurrentHashMap<>();
 	private List<InetAddress> validBindAddresses = Collections.emptyList();
 	private volatile RPCServer[] activeServers = new RPCServer[0];
+	private SpamThrottle outgoingThrottle = new SpamThrottle();
 	
 	public void refresh(long now) {
 		if(destroyed)
@@ -43,6 +47,13 @@ public class RPCServerManager {
 			srv.checkReachability(now);
 			if(srv.isReachable())
 				reachableServers.add(srv);
+		}
+		
+		if(reachableServers.size() > 0) {
+			CompletableFuture<RPCServer> cf = activeServerFuture.getAndSet(null);
+			if(cf != null) {
+				cf.complete(reachableServers.get(ThreadLocalRandom.current().nextInt(reachableServers.size())));
+			}
 		}
 		
 		activeServers = reachableServers.toArray(new RPCServer[reachableServers.size()]);
@@ -133,6 +144,7 @@ public class RPCServerManager {
 	private void newServer(InetAddress addr) {
 		RPCServer srv = new RPCServer(this,addr,dht.config.getListeningPort(), dht.serverStats);
 		// doing the socket setup takes time, do it in the background
+		srv.setOutgoingThrottle(outgoingThrottle);
 		onServerRegistration.forEach(c -> c.accept(srv));
 		interfacesInUse.put(addr, srv);
 		dht.getScheduler().execute(srv::start);
@@ -147,11 +159,18 @@ public class RPCServerManager {
 	void serverRemoved(RPCServer srv) {
 		interfacesInUse.remove(srv.getBindAddress(),srv);
 		refresh(System.currentTimeMillis());
+		dht.getTaskManager().removeServer(srv);
 	}
 	
 	public void destroy() {
 		destroyed = true;
 		new ArrayList<>(interfacesInUse.values()).parallelStream().forEach(RPCServer::stop);
+		
+		CompletableFuture<RPCServer> cf = activeServerFuture.getAndSet(null);
+		if(cf != null) {
+			cf.completeExceptionally(new DHTException("could not obtain active server, DHT was shut down"));
+		}
+		
 	}
 	
 	public int getServerCount() {
@@ -161,6 +180,10 @@ public class RPCServerManager {
 	public int getActiveServerCount()
 	{
 		return activeServers.length;
+	}
+	
+	public SpamThrottle getOutgoingRequestThrottle() {
+		return outgoingThrottle;
 	}
 	
 	/**
@@ -173,6 +196,16 @@ public class RPCServerManager {
 		if(srvs.length == 0)
 			return fallback ? getRandomServer() : null;
 		return srvs[ThreadLocalUtils.getThreadLocalRandom().nextInt(srvs.length)];
+	}
+	
+	AtomicReference<CompletableFuture<RPCServer>> activeServerFuture = new AtomicReference<>(null);
+	
+	public CompletableFuture<RPCServer> awaitActiveServer() {
+		return activeServerFuture.updateAndGet(existing -> {
+			if(existing != null)
+				return existing;
+			return new CompletableFuture<>();
+		});
 	}
 	
 	/**

@@ -41,7 +41,6 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
@@ -55,7 +54,7 @@ import java.util.function.Consumer;
  */
 public abstract class Task implements Comparable<Task> {
 
-	protected Map<Key, RPCCall>			inFlight;
+	protected Set<RPCCall>			inFlight;
 	
 	protected Node						node;
 
@@ -100,7 +99,7 @@ public abstract class Task implements Comparable<Task> {
 		this.rpc = rpc;
 		this.node = node;
 	
-		inFlight = new ConcurrentHashMap<>();
+		inFlight = ConcurrentHashMap.newKeySet();
 	}
 	
 	boolean setState(TaskState expected, TaskState newState) {
@@ -163,15 +162,15 @@ public abstract class Task implements Comparable<Task> {
 				
 				switch(current) {
 					case RESPONDED:
-						inFlight.remove(c.getExpectedID(), c);
+						inFlight.remove(c);
 						if (!isFinished())
 							callFinished(c, c.getResponse());
 						break;
 					case ERROR:
-						inFlight.remove(c.getExpectedID(), c);
+						inFlight.remove(c);
 						break;
 					case TIMEOUT:
-						inFlight.remove(c.getExpectedID(), c);
+						inFlight.remove(c);
 						if (!isFinished())
 							callTimeout(c);
 						break;
@@ -192,7 +191,7 @@ public abstract class Task implements Comparable<Task> {
 					case TIMEOUT:
 					case STALLED:
 					case ERROR:
-						runStuff();
+						serializedUpdate.run();
 						break;
 					default:
 						break;
@@ -210,7 +209,7 @@ public abstract class Task implements Comparable<Task> {
 			startTime = System.currentTimeMillis();
 			try
 			{
-				runStuff();
+				serializedUpdate.run();
 			} catch (Exception e)
 			{
 				DHT.log(e, LogLevel.Error);
@@ -223,7 +222,7 @@ public abstract class Task implements Comparable<Task> {
 			finish();
 		
 		if (canDoRequest() && !isFinished()) {
-			serializedUpdate.run();
+			update();
 
 			// check again in case todo-queue has been drained by update()
 			if(isDone())
@@ -233,7 +232,7 @@ public abstract class Task implements Comparable<Task> {
 
 	}
 	
-	private final Runnable serializedUpdate = SerializedTaskExecutor.onceMore(this::update);
+	private final Runnable serializedUpdate = SerializedTaskExecutor.onceMore(this::runStuff);
 
 	/**
 	 * Will continue the task, this will be called every time we have
@@ -262,7 +261,7 @@ public abstract class Task implements Comparable<Task> {
 	boolean rpcCall (MessageBase req, Key expectedID, Consumer<RPCCall> modifyCallBeforeSubmit) {
 		if (!canDoRequest()) {
 			// if we reject a request we need something to wakeup the task later
-			rpc.onDeclog(this::runStuff);
+			rpc.onDeclog(serializedUpdate);
 			return false;
 		}
 		
@@ -278,8 +277,7 @@ public abstract class Task implements Comparable<Task> {
 		
 		call.addListener(postProcessingListener);
 
-		inFlight.put(expectedID, call);
-
+		inFlight.add(call);
 		
 		// asyncify since we're under a lock here
 		rpc.getDHT().getScheduler().execute(() -> rpc.doCall(call)) ;

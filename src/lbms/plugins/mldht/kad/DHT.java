@@ -37,6 +37,8 @@ import lbms.plugins.mldht.kad.messages.PingRequest;
 import lbms.plugins.mldht.kad.messages.PingResponse;
 import lbms.plugins.mldht.kad.messages.PutRequest;
 import lbms.plugins.mldht.kad.messages.PutResponse;
+import lbms.plugins.mldht.kad.messages.SampleRequest;
+import lbms.plugins.mldht.kad.messages.SampleResponse;
 import lbms.plugins.mldht.kad.messages.UnknownTypeResponse;
 import lbms.plugins.mldht.kad.tasks.AnnounceTask;
 import lbms.plugins.mldht.kad.tasks.NodeLookup;
@@ -490,6 +492,22 @@ public class DHT implements DHTBase {
 		node.recieved(r);
 	}
 
+	public void sample(SampleRequest r) {
+		if(!isRunning())
+			return;
+
+		SampleResponse rsp = new SampleResponse(r.getMTID());
+		rsp.setSamples(db.samples());
+		rsp.setDestination(r.getOrigin());
+		rsp.setNum(db.getStats().getKeyCount());
+		rsp.setInterval((int) TimeUnit.MILLISECONDS.toSeconds(DHTConstants.CHECK_FOR_EXPIRED_ENTRIES));
+		populateResponse(r.getTarget(), rsp, r.doesWant4() ? DHTConstants.MAX_ENTRIES_PER_BUCKET : 0, r.doesWant6() ? DHTConstants.MAX_ENTRIES_PER_BUCKET : 0);
+
+		r.getServer().sendMessage(rsp);
+
+		node.recieved(r);
+	}
+
 	public void error (ErrorMessage r) {
 		StringBuilder b = new StringBuilder();
 		b.append("Error [").append( r.getCode() ).append("] from: " ).append(r.getOrigin());
@@ -633,6 +651,8 @@ public class DHT implements DHTBase {
 				mismatchDetector.add(c);
 			if(current == RPCState.RESPONDED || current == RPCState.TIMEOUT)
 				unreachableCache.onCallFinished(c);
+			if(current == RPCState.RESPONDED || current == RPCState.TIMEOUT || current == RPCState.STALLED)
+				tman.dequeue(c.getRequest().getServer());
 		}
 	};
 	
@@ -690,7 +710,9 @@ public class DHT implements DHTBase {
 		stats.resetStartedTimestamp();
 
 		logInfo("Starting DHT on port " + getPort());
-		resolveBootstrapAddresses();
+
+		// we need the IPs to filter bootstrap nodes out from the routing table. but don't block startup on DNS resolution
+		scheduler.execute(this::resolveBootstrapAddresses);
 		
 		connectionManager = new NIOConnectionManager("mlDHT "+type.shortName+" NIO Selector");
 		
@@ -937,22 +959,22 @@ public class DHT implements DHTBase {
 	
 	private void resolveBootstrapAddresses() {
 		List<InetSocketAddress> nodeAddresses =  new ArrayList<>();
-		
-		try {
-			for(InetSocketAddress unres : config.getUnresolvedBootstrapNodes()) {
+
+		for(InetSocketAddress unres : config.getUnresolvedBootstrapNodes()) {
+  		try {
 				for(InetAddress addr : InetAddress.getAllByName(unres.getHostString())) {
 					if(type.canUseAddress(addr))
 						nodeAddresses.add(new InetSocketAddress(addr, unres.getPort()));
 				}
-				
+			} catch (Exception e) {
+				DHT.log("DNS lookupg for " + unres.getHostString() + "failed: " + e.getMessage(), LogLevel.Info);
 			}
-			
-		} catch(Exception e) {
-			DHT.log(e, LogLevel.Error);
-			return;
+
 		}
 		
-		bootstrapAddresses = nodeAddresses;
+		// don't overwrite old addresses if DNS fails
+		if(!nodeAddresses.isEmpty())
+			bootstrapAddresses = nodeAddresses;
 	}
 	
 	Collection<InetSocketAddress> getBootStrapNodes() {
@@ -1005,6 +1027,7 @@ public class DHT implements DHTBase {
 						f.complete(c);
 				}
 			});
+			callFutures.add(f);
 			srv.doCall(c);
 		}
 		

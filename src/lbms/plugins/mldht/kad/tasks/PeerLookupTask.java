@@ -27,6 +27,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import java.util.stream.Collectors;
 
+import static java.lang.Math.min;
+
 import lbms.plugins.mldht.kad.AnnounceNodeCache;
 import lbms.plugins.mldht.kad.DBItem;
 import lbms.plugins.mldht.kad.DHT;
@@ -108,13 +110,15 @@ public class PeerLookupTask extends IteratingTask {
 			throw new IllegalStateException("cannot change lookup mode after startup");
 		this.fastTerminate = fastTerminate;
 		todo.allowRetransmits(!fastTerminate);
-		if(fastTerminate) {
+		if(fastTerminate)
 			setNoAnnounce(true);
+	}
+	
+	public void filterKnownUnreachableNodes(boolean toggle) {
+		if(toggle)
 			todo.setNonReachableCache(node.getDHT().getUnreachableCache());
-		} else {
+		else
 			todo.setNonReachableCache(null);
-		}
-			
 	}
 
 	public void setNoAnnounce(boolean noAnnounce) {
@@ -216,15 +220,12 @@ public class PeerLookupTask extends IteratingTask {
 				if(p == RequestPermit.NONE_ALLOWED)
 					break;
 				
-				KBucketEntry e = todo.next().orElse(null);
+				KBucketEntry e = todo.next2(kbe -> {
+					RequestCandidateEvaluator eval = new RequestCandidateEvaluator(this, closest, todo, kbe, inFlight);
+					return eval.goodForRequest(p);
+				}).orElse(null);
 				
 				if(e == null)
-					break;
-
-				RequestCandidateEvaluator eval = new RequestCandidateEvaluator(this, closest, todo, e, inFlight.values());
-				
-				
-				if(!eval.goodForRequest(p))
 					break;
 				
 				GetPeersRequest gpr = new GetPeersRequest(targetKey);
@@ -239,11 +240,17 @@ public class PeerLookupTask extends IteratingTask {
 					if(useCache)
 						call.addListener(cache.getRPCListener());
 					call.builtFromEntry(e);
-					// the measured RTT is a mean and not the 90th percentile unlike the RPCServer's timeout filter
-					// -> add some safety margin to account for variance
-					long rtt = e.getRTT() * 2;
-					if(rtt < DHTConstants.RPC_CALL_TIMEOUT_MAX && rtt < rpc.getTimeoutFilter().getStallTimeout())
-						call.setExpectedRTT(rtt); // only set a node-specific timeout if it's better than what the server would apply anyway
+
+					long rtt = e.getRTT();
+					long defaultTimeout = rpc.getTimeoutFilter().getStallTimeout();
+					
+					if(rtt < DHTConstants.RPC_CALL_TIMEOUT_MAX) {
+						// the measured RTT is a mean and not the 90th percentile unlike the RPCServer's timeout filter
+						// -> add some safety margin to account for variance
+						rtt = (long) (rtt * (rtt < defaultTimeout ? 2 : 1.5));
+						
+						call.setExpectedRTT(min(rtt, DHTConstants.RPC_CALL_TIMEOUT_MAX));
+					}
 					
 					if(DHT.isLogLevelEnabled(LogLevel.Verbose)) {
 						List<InetSocketAddress> sources = todo.getSources(e).stream().map(KBucketEntry::getAddress).collect(Collectors.toList());
@@ -275,7 +282,7 @@ public class PeerLookupTask extends IteratingTask {
 		}
 		
 				
-		RequestCandidateEvaluator eval = new RequestCandidateEvaluator(this, this.closest, todo, closest, inFlight.values());
+		RequestCandidateEvaluator eval = new RequestCandidateEvaluator(this, this.closest, todo, closest, inFlight);
 
 		return eval.terminationPrecondition();
 	}

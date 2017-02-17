@@ -1,17 +1,21 @@
 package the8472.mldht;
 
+import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
+import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -25,10 +29,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
 import lbms.plugins.mldht.kad.DHT;
 import lbms.plugins.mldht.kad.KBucketEntry;
 import lbms.plugins.mldht.kad.Key;
 import lbms.plugins.mldht.kad.PeerAddressDBItem;
+import lbms.plugins.mldht.kad.RPCServer;
 import lbms.plugins.mldht.kad.DHT.LogLevel;
 import lbms.plugins.mldht.kad.tasks.PeerLookupTask;
 import lbms.plugins.mldht.kad.utils.AddressUtils;
@@ -37,23 +44,30 @@ import the8472.bt.MetadataPool;
 import the8472.bt.MetadataPool.Completion;
 import the8472.bt.PullMetaDataConnection;
 import the8472.bt.PullMetaDataConnection.CONNECTION_STATE;
+import the8472.bt.PullMetaDataConnection.CloseReason;
 import the8472.bt.PullMetaDataConnection.MetaConnectionHandler;
 import the8472.bt.UselessPeerFilter;
 import the8472.utils.concurrent.LoggingScheduledThreadPoolExecutor;
+import the8472.utils.io.ConnectionAcceptor;
 
 public class TorrentFetcher {
 	
 	Collection<DHT> dhts;
 	ScheduledThreadPoolExecutor timer;
 	NIOConnectionManager conMan = new NIOConnectionManager("torrent fetcher");
+	ConnectionAcceptor serverSelector;
 	
 	AtomicInteger socketsIncludingHalfOpen = new AtomicInteger();
+	AtomicInteger incomingConnections = new AtomicInteger();
 	AtomicInteger openConnections = new AtomicInteger();
+	Map<RPCServer, Set<Key>> activeLookups = new HashMap<>();
 	
 	List<FetchTask> tasks = new ArrayList<>();
 	
 	int maxOpen = 10;
 	int maxSockets = 1000;
+	int maxIncoming = 0;
+			
 	
 	public TorrentFetcher(Collection<DHT> dhts) {
 		this.dhts = dhts;
@@ -66,12 +80,71 @@ public class TorrentFetcher {
 		this.maxSockets = maxHalfOpen;
 	}
 	
+	boolean incomingConnection(SocketChannel chan) {
+		PullMetaDataConnection con = new PullMetaDataConnection(chan);
+		
+		if(incomingConnections.get() > maxIncoming)
+			return false;
+		
+		incomingConnections.incrementAndGet();
+		
+		con.setListener(new MetaConnectionHandler() {
+			
+			@Override
+			public void onTerminate() {
+				incomingConnections.decrementAndGet();
+				
+			}
+			
+			@Override
+			public void onStateChange(CONNECTION_STATE oldState, CONNECTION_STATE newState) {
+				if(newState == CONNECTION_STATE.STATE_IH_RECEIVED) {
+					Key ih = con.getInfohash();
+					try {
+						Optional<FetchTask> ft;
+						
+						synchronized (TorrentFetcher.this) {
+							ft = tasks.stream()
+									.filter((t -> t.hash.equals(ih)))
+									.findAny();
+						}
+						
+						if (!ft.isPresent()) {
+							con.terminate("currently not servicing infohash " + ih.toString(false), CloseReason.OTHER);
+							return;
+						}
+
+						ft.get().registerIncomingConnection(con);
+					} catch (IOException e) {
+						DHT.log(e, LogLevel.Error);
+					}
+				}
+				
+			}
+			
+			@Override
+			public void onConnect() {
+				// TODO Auto-generated method stub
+				
+			}
+		});
+		conMan.register(con);
+		
+		return true;
+	}
+	
 	public void setMaxOpen(int maxOpen) {
 		this.maxOpen = maxOpen;
 	}
 	
 	public int openConnections() {
 		return openConnections.get();
+	}
+	
+	public void maxIncoming(int max) {
+		maxIncoming = max;
+		serverSelector = new ConnectionAcceptor(this::incomingConnection);
+		conMan.register(serverSelector);
 	}
 	
 	public int socketcount() {
@@ -93,13 +166,13 @@ public class TorrentFetcher {
 	void ensureRunning() {
 		synchronized (this) {
 			if(f == null && tasks.size() > 0) {
-				f = timer.scheduleWithFixedDelay(this::scheduleConnections, 0, 1, TimeUnit.SECONDS);
+				f = timer.scheduleWithFixedDelay(this::schedule, 0, 1, TimeUnit.SECONDS);
 			}
 				
 		}
 	}
 	
-	void scheduleConnections() {
+	void schedule() {
 		synchronized (this) {
 			if(tasks.size() == 0 && f != null) {
 				f.cancel(false);
@@ -107,22 +180,74 @@ public class TorrentFetcher {
 				return;
 			}
 			
-			int offset = ThreadLocalRandom.current().nextInt(tasks.size());
-				
-			for(int i= 0;i<tasks.size();i++) {
-				int idx = Math.floorMod(i+offset, tasks.size());
-				
-				if(socketLimitsReached())
-					break;
-				
-				tasks.get(idx).connections();
-			}
+			startDHTTasks();
+			startConnections();
 			
-			
-				
-						
 		}
 	}
+	
+	
+	void startDHTTasks() {
+		// choose servers, then pick the task which maximizes the target key distance to all currently running tasks on that server
+		// this should avoid running adjacent keys at the same time
+		// conversely that means adjacent tasks are scheduled only after the previous one finished, which will make the caches more effective
+
+		while(true) {
+			FetchTask best = null;
+			List<RPCServer> servers = dhts.stream().filter(DHT::isRunning).map(d -> d.getServerManager().getRandomActiveServer(false)).filter(Objects::nonNull).collect(Collectors.toList());
+
+			if(servers.isEmpty())
+				break;
+
+			if(!servers.stream().allMatch(s -> s.getDHT().getTaskManager().queuedCount(s) == 0))
+				break;
+
+			
+			synchronized (this) {
+				Key bestDistance = Key.MIN_KEY;
+				
+				if(ThreadLocalRandom.current().nextFloat() < 0.05) {
+					best = tasks.stream().filter(t -> !t.dhtStarted).findFirst().orElse(null);
+				} else {
+					for(FetchTask t : tasks) {
+						if(t.dhtStarted)
+							continue;
+						
+						Key dist = servers.stream().flatMap(s -> activeLookups.getOrDefault(s, Collections.emptySet()).stream()).map(k -> t.hash.distance(k)).min(Comparator.naturalOrder()).orElse(Key.MAX_KEY);
+						
+						if(bestDistance.compareTo(dist) <= 0) {
+							best = t;
+							bestDistance = dist;
+						}
+						
+					}
+					
+				}
+
+			}
+			
+			if(best == null)
+				break;
+			best.lookups(servers.stream());
+			// since we only schedule new tasks when the queues are empty we want the manager to start them immediately instead of waiting for timers
+			servers.stream().forEach(s -> s.getDHT().getTaskManager().dequeue(s));
+		}
+	}
+
+	void startConnections() {
+		int offset = ThreadLocalRandom.current().nextInt(tasks.size());
+		
+		for(int i= 0;i<tasks.size();i++) {
+			int idx = Math.floorMod(i+offset, tasks.size());
+			
+			if(socketLimitsReached())
+				break;
+			
+			tasks.get(idx).connections();
+		}
+		
+	}
+	
 	
 	public enum FetchState {
 		PENDING,
@@ -136,15 +261,16 @@ public class TorrentFetcher {
 		Instant startTime;
 		CompletableFuture<FetchTask> future = new CompletableFuture<>();
 		Set<InetSocketAddress> pinged = Collections.newSetFromMap(new ConcurrentHashMap<>()) ;
-		Set<InetSocketAddress> connectionAttempted = Collections.newSetFromMap(new ConcurrentHashMap<>());
 		Map<InetSocketAddress, PullMetaDataConnection.CONNECTION_STATE> closed = new ConcurrentHashMap<>();
 		ConcurrentHashMap<InetSocketAddress, Set<InetAddress>> candidates = new ConcurrentHashMap<>();
 		AtomicBoolean running = new AtomicBoolean(true);
-		ByteBuffer result;
+		MetadataPool result;
 		AtomicInteger thingsBlockingCompletion = new AtomicInteger(1);
 		
-		Set<PullMetaDataConnection> connections = Collections.newSetFromMap(new ConcurrentHashMap<>());
+		Map<InetAddress, PullMetaDataConnection> connections = new ConcurrentHashMap<>();
 		Map<Integer, MetadataPool> pools = new ConcurrentHashMap<>();
+		
+		boolean dhtStarted;
 		
 		FetchState state = FetchState.PENDING;
 		
@@ -162,10 +288,10 @@ public class TorrentFetcher {
 					hash.toString(false),
 					"age:",
 					Duration.between(startTime, Instant.now()).toString(),
-					"con tried:",
-					String.valueOf(connectionAttempted.size()),
+					"cand:",
+					String.valueOf(candidates.size()),
 					"con active:",
-					connections.stream().collect(Collectors.groupingBy(PullMetaDataConnection::getState, Collectors.counting())).toString(),
+					connections.values().stream().collect(Collectors.groupingBy(PullMetaDataConnection::getState, Collectors.counting())).toString(),
 					"con closed:",
 					closeCounts().toString()
 			};
@@ -178,7 +304,7 @@ public class TorrentFetcher {
 		}
 		
 		public Optional<ByteBuffer> getResult() {
-			return Optional.ofNullable(result);
+			return Optional.ofNullable(result).map(MetadataPool::merge);
 		}
 		
 		public void stop() {
@@ -186,7 +312,7 @@ public class TorrentFetcher {
 				return;
 			if(state == FetchState.PENDING)
 				state = FetchState.FAILURE;
-			connections.forEach(c -> {
+			connections.values().forEach(c -> {
 				try {
 					c.terminate("fetch task finished");
 				} catch (Exception e) {
@@ -203,12 +329,11 @@ public class TorrentFetcher {
 		}
 		
 		public int attemptedCount() {
-			return connectionAttempted.size();
+			return connections.size() + closed.size();
 		}
 
 		void start() {
 			startTime = Instant.now();
-			lookups();
 		}
 		
 		void addCandidate(KBucketEntry source, PeerAddressDBItem toAdd) {
@@ -242,33 +367,41 @@ public class TorrentFetcher {
 			this.conf = conf;
 		}
 		
-		void lookups() {
-			List<Runnable> starters = dhts.stream().filter(DHT::isRunning).map(d -> {
-				return Optional.ofNullable(d.getServerManager().getRandomActiveServer(false)).map(srv -> {
-					PeerLookupTask task = new PeerLookupTask(srv, d.getNode(), hash);
-					
-					task.setNoAnnounce(true);
-					if(conf != null)
-						conf.accept(task);
-					task.setResultHandler(this::addCandidate);
-					task.addListener(t -> {
-						thingsBlockingCompletion.decrementAndGet();
-						checkCompletion();
-					});
-					
-					thingsBlockingCompletion.incrementAndGet();
-					
-					
-					
-					future.thenAccept(x -> task.kill());
+		void lookups(Stream<RPCServer> servers) {
+			dhtStarted = true;
+			
+			servers.forEach(srv -> {
+				DHT d = srv.getDHT();
+				PeerLookupTask task = new PeerLookupTask(srv, d.getNode(), hash);
+				
+				
+				synchronized (TorrentFetcher.this) {
+					activeLookups.computeIfAbsent(srv, unused -> new HashSet<>()).add(task.getTargetKey());
+				}
 
-					return (Runnable)() -> {d.getTaskManager().addTask(task);};
+				task.setNoAnnounce(true);
+				if(conf != null)
+					conf.accept(task);
+				task.setResultHandler(this::addCandidate);
+				task.addListener(t -> {
+					synchronized (TorrentFetcher.this) {
+						activeLookups.get(srv).remove(task.getTargetKey());
+					}
+					
+					thingsBlockingCompletion.decrementAndGet();
+					checkCompletion();
+					timer.execute(TorrentFetcher.this::startDHTTasks);
 				});
-			}).filter(Optional::isPresent).map(Optional::get).collect(Collectors.toList());
 
-			// start tasks after we've incremented counters for all tasks
-			// otherwise tasks might finish so fast that the counters go back down to 0
-			starters.forEach(Runnable::run);
+				thingsBlockingCompletion.incrementAndGet();
+
+
+
+				future.thenAccept(x -> task.kill());
+				
+				d.getTaskManager().addTask(task);
+			});
+
 			thingsBlockingCompletion.decrementAndGet();
 		}
 		
@@ -279,6 +412,81 @@ public class TorrentFetcher {
 			}
 		}
 		
+		void registerIncomingConnection(PullMetaDataConnection con) throws IOException {
+			if(closed.entrySet().stream().anyMatch(e -> e.getKey().getAddress().equals(con.remoteAddress().getAddress()) && !e.getValue().neverConnected())) {
+				con.terminate("already connected", CloseReason.OTHER);
+				return;
+			}
+			
+			PullMetaDataConnection existing = connections.putIfAbsent(con.remoteAddress().getAddress(),con);
+			
+			if(existing != null) {
+				if(existing.isState(CONNECTION_STATE.STATE_CONNECTING) && !existing.isIncoming()) {
+					existing.terminate("incoming connection takes precedence", CloseReason.OTHER);
+					connections.put(con.remoteAddress().getAddress(), con);
+				} else {
+					con.terminate("connection to remote address already established", CloseReason.OTHER);
+					return;
+				}
+					
+			}
+			
+			decorate(con);
+			openConnections.incrementAndGet();
+			thingsBlockingCompletion.incrementAndGet();
+			
+			con.setListener(new MetaConnectionHandler() {
+				
+				@Override
+				public void onTerminate() {
+					incomingConnections.decrementAndGet();
+				}
+				
+				@Override
+				public void onStateChange(CONNECTION_STATE oldState, CONNECTION_STATE newState) {
+					if(newState == CONNECTION_STATE.STATE_CLOSED) {
+						processPool(con.getMetaData());
+						openConnections.decrementAndGet();
+						thingsBlockingCompletion.decrementAndGet();
+						connections.remove(con.remoteAddress().getAddress(), con);
+						closed.put(con.remoteAddress(), oldState);
+					}
+
+				}
+				
+				@Override
+				public void onConnect() {
+					// TODO Auto-generated method stub
+					
+				}
+			});
+			
+		}
+		
+		void processPool(MetadataPool pool) {
+			if (pool == null)
+				return;
+			if (pool.status() == Completion.SUCCESS) {
+				result = pool;
+				state = FetchState.SUCCESS;
+				stop();
+			}
+			if (pool.status() == Completion.FAILED) {
+				pools.remove(pool.bytes(), pool);
+			}
+		}
+		
+		void decorate(PullMetaDataConnection con) {
+			con.poolGenerator = this::getPool;
+			con.dhtPort = dhts.stream().mapToInt(d -> d.getConfig().getListeningPort()).findAny().getAsInt();
+			con.pexConsumer = (toAdd) -> {
+				toAdd.forEach(item -> {
+					this.addCandidate(con.remoteAddress().getAddress(), item);
+				});
+			};
+			
+		}
+		
 		void connections() {
 			checkCompletion();
 			
@@ -286,8 +494,9 @@ public class TorrentFetcher {
 				return;
 			}
 			
-			
-			candidates.keySet().removeAll(connectionAttempted);
+			// workaround for JDK-8163353
+			if(!closed.isEmpty())
+				candidates.keySet().removeAll(closed.keySet());
 			
 			Comparator<Map.Entry<InetSocketAddress, Set<InetAddress>>> comp = Map.Entry.comparingByValue(Comparator.comparingInt(Set::size));
 			comp = comp.reversed();
@@ -300,46 +509,56 @@ public class TorrentFetcher {
 			
 			for(InetSocketAddress addr : cands) {
 				
+				if(connections.containsKey(addr.getAddress()))
+					continue;
+				
 				if(socketLimitsReached())
 					break;
 				if(i++ > 5)
 					break;
 				
-				connectionAttempted.add(addr);
+				
+				PullMetaDataConnection con;
+						
+				try {
+					con = new PullMetaDataConnection(hash.getHash(), addr);
+				} catch (IOException e) {
+					DHT.log(e, LogLevel.Error);
+					break;
+				}
+
+
+				if(connections.putIfAbsent(addr.getAddress(), con) != null) {
+					try {
+						con.terminate("connection to that socket address already open", CloseReason.OTHER);
+					} catch (IOException e) {
+						DHT.log(e, LogLevel.Error);
+					}
+					i--;
+					continue;
+				}
+
 				candidates.remove(addr);
 
-				PullMetaDataConnection con = new PullMetaDataConnection(hash.getHash(), addr);
+
+
 				
-				con.keepPexOnlyOpen(cands.length < 20);
+				if(serverSelector != null && serverSelector.getPort() > 0)
+					con.ourListeningPort = serverSelector.getPort();
 				
-				con.poolGenerator = this::getPool;
-				con.dhtPort = dhts.stream().mapToInt(d -> d.getConfig().getListeningPort()).findAny().getAsInt();
-				con.pexConsumer = (toAdd) -> {
-					toAdd.forEach(item -> {
-						this.addCandidate(addr.getAddress(), item);
-					});
-				};
+				con.keepPexOnlyOpen(closed.values().stream().filter(CONNECTION_STATE.STATE_PEX_ONLY::equals).count() < 20);
 				
-				connections.add(con);
-				
+				decorate(con);
+			
 				con.setListener(new MetaConnectionHandler() {
 
 					@Override
 					public void onTerminate() {
-						connections.remove(con);
+						connections.remove(con.remoteAddress().getAddress(), con);
 						
 						MetadataPool pool = con.getMetaData();
-						
-						if(pool != null) {
-							if(pool.status() == Completion.SUCCESS) {
-								result = pool.merge();
-								state = FetchState.SUCCESS;
-								stop();
-							}
-							if(pool.status() == Completion.FAILED) {
-								pools.remove(pool.bytes(), pool);
-							}
-						}
+						processPool(pool);
+
 							
 						thingsBlockingCompletion.decrementAndGet();
 						if(pf != null)
