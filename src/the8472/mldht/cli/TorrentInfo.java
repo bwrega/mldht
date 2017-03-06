@@ -1,16 +1,15 @@
 package the8472.mldht.cli;
 
-import static the8472.utils.Functional.typedGet;
-
+import lbms.plugins.mldht.kad.Key;
+import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
 import the8472.bencode.PrettyPrinter;
 import the8472.bencode.Tokenizer.BDecodingException;
 import the8472.bt.TorrentUtils;
 import the8472.utils.concurrent.SerializedTaskExecutor;
 
-import lbms.plugins.mldht.kad.Key;
-import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
-
+import java.io.BufferedReader;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.UncheckedIOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
@@ -32,6 +31,8 @@ import java.util.Optional;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import static the8472.utils.Functional.typedGet;
 
 public class TorrentInfo {
 	
@@ -113,9 +114,12 @@ public class TorrentInfo {
 		boolean noTrunc = ParseArgs.extractBool(args, "-notrunc");
 		boolean recursive = ParseArgs.extractBool(args, "-r");
 		boolean printLargest = ParseArgs.extractBool(args, "-largest");
+		boolean readFileListFromStdin = ParseArgs.extractBool(args, "-");
+
+		Stream<String> torrentFiles = readFileListFromStdin ? new BufferedReader(new InputStreamReader(System.in)).lines().parallel()
+			: args.parallelStream();
 		
-		
-		Stream<Path> torrents = args.parallelStream().unordered().map(Paths::get).filter(Files::exists).flatMap(p -> {
+		Stream<Path> torrents = torrentFiles.map(Paths::get).filter(Files::exists).flatMap(p -> {
 			try {
 				return Files.find(p, recursive ? Integer.MAX_VALUE :  1 , (f, attr) -> {
 					return attr.isRegularFile() && attr.size() > 0;
