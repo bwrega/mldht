@@ -39,7 +39,7 @@ public class TorrentInfo {
 	Path source;
 	ByteBuffer raw;
 	Map<String, Object> root;
-	Map<String, Object> info;
+	public Map<String, Object> info;
 	Charset encoding = StandardCharsets.UTF_8;
 	boolean truncate = true;
 	
@@ -58,7 +58,7 @@ public class TorrentInfo {
 		}
 	}
 	
-	void decode() {
+	public void decode() {
 		if(root != null)
 			return;
 		readRaw();
@@ -76,11 +76,11 @@ public class TorrentInfo {
 		}
 	}
 	
-	Key infoHash() {
+	public Key infoHash() {
 		return TorrentUtils.infohash(raw);
 	}
 	
-	Optional<String> name() {
+	public Optional<String> name() {
 		decode();
 		Optional<String> name = typedGet(info, "name.utf-8", byte[].class).map(b -> new String(b, StandardCharsets.UTF_8));
 		if(!name.isPresent()) {
@@ -89,8 +89,13 @@ public class TorrentInfo {
 		
 		return name;
 	}
-	
-	List<Map<String, Object>> files() {
+
+	public Long totalSize() {
+		return typedGet(info, "length", Long.class)
+			.orElseGet(() -> files().stream().mapToLong(e -> typedGet(e, "length", Long.class).orElse(0L)).sum());
+	}
+
+	public List<Map<String, Object>> files() {
 		return typedGet(info, "files", List.class).map((List l) -> {
 			return (List<Map<String, Object>>)l.stream().filter(Map.class::isInstance).collect(Collectors.toList());
 		}).orElse(Collections.emptyList());
