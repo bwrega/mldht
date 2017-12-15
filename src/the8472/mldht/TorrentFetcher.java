@@ -1,5 +1,24 @@
 package the8472.mldht;
 
+import lbms.plugins.mldht.kad.DHT;
+import lbms.plugins.mldht.kad.DHT.LogLevel;
+import lbms.plugins.mldht.kad.KBucketEntry;
+import lbms.plugins.mldht.kad.Key;
+import lbms.plugins.mldht.kad.PeerAddressDBItem;
+import lbms.plugins.mldht.kad.RPCServer;
+import lbms.plugins.mldht.kad.tasks.PeerLookupTask;
+import lbms.plugins.mldht.kad.utils.AddressUtils;
+import lbms.plugins.mldht.utils.NIOConnectionManager;
+import the8472.bt.MetadataPool;
+import the8472.bt.MetadataPool.Completion;
+import the8472.bt.PullMetaDataConnection;
+import the8472.bt.PullMetaDataConnection.CONNECTION_STATE;
+import the8472.bt.PullMetaDataConnection.CloseReason;
+import the8472.bt.PullMetaDataConnection.MetaConnectionHandler;
+import the8472.bt.UselessPeerFilter;
+import the8472.utils.concurrent.LoggingScheduledThreadPoolExecutor;
+import the8472.utils.io.ConnectionAcceptor;
+
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -30,25 +49,6 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
-import lbms.plugins.mldht.kad.DHT;
-import lbms.plugins.mldht.kad.KBucketEntry;
-import lbms.plugins.mldht.kad.Key;
-import lbms.plugins.mldht.kad.PeerAddressDBItem;
-import lbms.plugins.mldht.kad.RPCServer;
-import lbms.plugins.mldht.kad.DHT.LogLevel;
-import lbms.plugins.mldht.kad.tasks.PeerLookupTask;
-import lbms.plugins.mldht.kad.utils.AddressUtils;
-import lbms.plugins.mldht.utils.NIOConnectionManager;
-import the8472.bt.MetadataPool;
-import the8472.bt.MetadataPool.Completion;
-import the8472.bt.PullMetaDataConnection;
-import the8472.bt.PullMetaDataConnection.CONNECTION_STATE;
-import the8472.bt.PullMetaDataConnection.CloseReason;
-import the8472.bt.PullMetaDataConnection.MetaConnectionHandler;
-import the8472.bt.UselessPeerFilter;
-import the8472.utils.concurrent.LoggingScheduledThreadPoolExecutor;
-import the8472.utils.io.ConnectionAcceptor;
 
 public class TorrentFetcher {
 	
@@ -213,7 +213,9 @@ public class TorrentFetcher {
 						if(t.dhtStarted)
 							continue;
 						
-						Key dist = servers.stream().flatMap(s -> activeLookups.getOrDefault(s, Collections.emptySet()).stream()).map(k -> t.hash.distance(k)).min(Comparator.naturalOrder()).orElse(Key.MAX_KEY);
+						Key dist = servers.stream().flatMap(s ->
+							activeLookups.getOrDefault(s, Collections.emptySet()).stream())
+							.map(k -> t.hash.distance(k)).min(Comparator.naturalOrder()).orElse(Key.MAX_KEY);
 						
 						if(bestDistance.compareTo(dist) <= 0) {
 							best = t;
