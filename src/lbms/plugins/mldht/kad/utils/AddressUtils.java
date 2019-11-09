@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.utils;
 
 import static the8472.utils.Functional.unchecked;
@@ -7,7 +12,6 @@ import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
-import java.net.InterfaceAddress;
 import java.net.NetworkInterface;
 import java.net.ProtocolFamily;
 import java.net.SocketException;
@@ -16,11 +20,12 @@ import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
 import java.nio.channels.DatagramChannel;
 import java.util.Collections;
-import java.util.LinkedList;
 import java.util.List;
+import java.util.stream.Stream;
 
 import lbms.plugins.mldht.kad.PeerAddressDBItem;
 import the8472.utils.Arrays;
+import the8472.utils.io.NetMask;
 
 public class AddressUtils {
 	
@@ -46,16 +51,39 @@ public class AddressUtils {
 		return raw[0] == 0x20 && raw[1] == 0x01 && raw[2] == 0x00 && raw[3] == 0x00;
 	}
 	
+	private final static byte[] LOCAL_BROADCAST = new byte[] {(byte) 0xff, (byte) 0xff, (byte) 0xff, (byte) 0xff};
+	
+	
+	static {
+		try {
+			// ::ffff:0:0/96
+			V4_MAPPED = new NetMask(Inet6Address.getByAddress(null, new byte[] {0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,(byte) 0xff,(byte) 0xff,0x00,0x00,0x00,0x00,}, null), 96);
+		} catch(Exception e) {
+			throw new Error("should not happen");
+		}
+		
+	}
+	
+	private final static NetMask V4_MAPPED;
+	private final static NetMask V4_COMPAT = NetMask.fromString("0000::/96");
+	
 	public static boolean isGlobalUnicast(InetAddress addr)
 	{
+		// local identification block
 		if(addr instanceof Inet4Address && addr.getAddress()[0] == 0)
+			return false;
+		// this would be rejected by a socket with broadcast disabled anyway, but filter it to reduce exceptions
+		if(addr instanceof Inet4Address && java.util.Arrays.equals(addr.getAddress(), LOCAL_BROADCAST))
+			return false;
+		if(addr instanceof Inet6Address && (addr.getAddress()[0] & 0xfe) == 0xfc) // fc00::/7
+			return false;
+		if(addr instanceof Inet6Address && (V4_MAPPED.contains(addr) || ((Inet6Address) addr).isIPv4CompatibleAddress()))
 			return false;
 		return !(addr.isAnyLocalAddress() || addr.isLinkLocalAddress() || addr.isLoopbackAddress() || addr.isMulticastAddress() || addr.isSiteLocalAddress());
 	}
 	
 	public static byte[] packAddress(InetSocketAddress addr) {
 		byte[] result = null;
-		int port = addr.getPort();
 		
 		if(addr.getAddress() instanceof Inet4Address) {
 			result = new byte[6];
@@ -90,11 +118,20 @@ public class AddressUtils {
 		int i = 0;
 		while(buf.hasRemaining()) {
 			buf.get(ip);
-			addrs[i] = new InetSocketAddress(unchecked(() -> InetAddress.getByAddress(ip)), Short.toUnsignedInt(buf.getShort()));
+			addrs[i] = new InetSocketAddress(unchecked(() -> AddressUtils.fromBytesVerbatim(ip)), Short.toUnsignedInt(buf.getShort()));
 			i++;
 		}
 		
 		return java.util.Arrays.asList(addrs);
+	}
+	
+	public static InetAddress fromBytesVerbatim(byte[] raw) throws UnknownHostException {
+		// bypass ipv4 mapped address conversion
+		if(raw.length == 16) {
+			return Inet6Address.getByAddress(null, raw, null);
+		}
+		
+		return InetAddress.getByAddress(raw);
 	}
 	
 	public static InetSocketAddress unpackAddress(byte[] raw) {
@@ -114,54 +151,31 @@ public class AddressUtils {
 	}
 	
 	
-
-	public static List<InetAddress> getAvailableGloballyRoutableAddrs(Class<? extends InetAddress> type) {
-		
-		LinkedList<InetAddress> addrs = new LinkedList<>();
-		
-		try
-		{
-			for (NetworkInterface iface : Collections.list(NetworkInterface.getNetworkInterfaces()))
-			{
-				if(!iface.isUp() || iface.isLoopback())
-					continue;
-				for (InterfaceAddress ifaceAddr : iface.getInterfaceAddresses())
-				{
-					if (type == Inet6Address.class && ifaceAddr.getAddress() instanceof Inet6Address)
-					{
-						Inet6Address addr = (Inet6Address) ifaceAddr.getAddress();
-						// only accept globally reachable IPv6 unicast addresses
-						if (addr.isIPv4CompatibleAddress() || !isGlobalUnicast(addr))
-							continue;
-	
-						// prefer other addresses over teredo
-						if (isTeredo(addr))
-							addrs.addLast(addr);
-						else
-							addrs.addFirst(addr);
-					}
-					
-					if(type == Inet4Address.class && ifaceAddr.getAddress() instanceof Inet4Address)
-					{
-						Inet4Address addr = (Inet4Address) ifaceAddr.getAddress();
-
-						if(!isGlobalUnicast(addr))
-							continue;
-					
-						addrs.add(addr);
-					}
+	public static Stream<InetAddress> allAddresses() {
+		try {
+			return Collections.list(NetworkInterface.getNetworkInterfaces()).stream().filter(iface -> {
+				try {
+					return iface.isUp();
+				} catch (SocketException e) {
+					e.printStackTrace();
+					return false;
 				}
-			}
-			
-		} catch (Exception e)
-		{
+			}).flatMap(iface -> Collections.list(iface.getInetAddresses()).stream());
+		} catch (SocketException e) {
 			e.printStackTrace();
+			return Stream.empty();
 		}
-		
-		Collections.sort(addrs, (a, b) -> Arrays.compareUnsigned(a.getAddress(), b.getAddress()));
-		
-		
-		return addrs;
+	}
+	
+	
+	public static Stream<InetAddress> nonlocalAddresses() {
+		return allAddresses().filter(addr -> {
+			return !addr.isAnyLocalAddress() && !addr.isLoopbackAddress();
+		});
+	}
+
+	public static Stream<InetAddress> availableGloballyRoutableAddrs(Stream<InetAddress> toFilter, Class<? extends InetAddress> type) {
+		return toFilter.filter(type::isInstance).filter(AddressUtils::isGlobalUnicast).sorted((a, b) -> Arrays.compareUnsigned(a.getAddress(), b.getAddress()));
 	}
 	
 	public static boolean isValidBindAddress(InetAddress addr) {

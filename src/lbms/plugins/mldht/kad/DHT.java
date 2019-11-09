@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad;
 
 import lbms.plugins.mldht.DHTConfiguration;
@@ -54,6 +43,7 @@ import lbms.plugins.mldht.utils.NIOConnectionManager;
 
 import java.io.IOException;
 import java.io.PrintWriter;
+import java.io.UncheckedIOException;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
 import java.net.InetAddress;
@@ -65,6 +55,7 @@ import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
@@ -82,6 +73,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static the8472.bencode.Utils.prettyPrint;
 import static the8472.utils.Functional.awaitAll;
@@ -178,7 +170,7 @@ public class DHT implements DHTBase {
 	private DHTStatus						status;
 	private PopulationEstimator				estimator;
 	private AnnounceNodeCache				cache;
-	private NIOConnectionManager			connectionManager;
+	NIOConnectionManager					connectionManager;
 	
 	RPCStats								serverStats;
 
@@ -722,9 +714,12 @@ public class DHT implements DHTBase {
 		node.loadTable(table_file);
 		
 
-		// these checks are fairly expensive on large servers (network interface enumeration)
+		// these checks query the available network interfaces, which can be expensive on some platforms
 		// schedule them separately
-		scheduledActions.add(scheduler.scheduleWithFixedDelay(serverManager::doBindChecks, 10, 10, TimeUnit.SECONDS));
+		scheduledActions.add(scheduler.scheduleWithFixedDelay(() -> {
+			serverManager.doBindChecks();
+			serverManager.startNewServers();
+		}, 10, 10, TimeUnit.SECONDS));
 		
 		scheduledActions.add(scheduler.scheduleWithFixedDelay(() -> {
 			// maintenance that should run all the time, before the first queries
@@ -735,8 +730,15 @@ public class DHT implements DHTBase {
 		}, 5000, DHTConstants.DHT_UPDATE_INTERVAL, TimeUnit.MILLISECONDS));
 
 		// initialize as many RPC servers as we need
-		serverManager.refresh(System.currentTimeMillis());
+		serverManager.startNewServers();
 		
+		if(serverManager.getServerCount() == 0) {
+			logError("No network interfaces eligible for DHT sockets found during startup."
+					+ "\nAddress family: " + this.getType()
+					+ "\nmultihoming [requires public IP addresses if enabled]: " + config.allowMultiHoming()
+					+ "\nPublic IP addresses: " + AddressUtils.availableGloballyRoutableAddrs(AddressUtils.allAddresses(), getType().PREFERRED_ADDRESS_TYPE).map(InetAddress::toString).collect(Collectors.joining(", "))
+					+ "\nDefault route: " + AddressUtils.getDefaultRoute(getType().PREFERRED_ADDRESS_TYPE));
+		}
 		
 		started();
 
@@ -845,11 +847,8 @@ public class DHT implements DHTBase {
 			return;
 		}
 
-		//scheduler.shutdown();
 		logInfo("Initated DHT shutdown");
-		for (Task t : tman.getActiveTasks()) {
-			t.kill();
-		}
+		Stream.concat(Arrays.stream(tman.getActiveTasks()), Arrays.stream(tman.getQueuedTasks())).forEach(Task::kill);
 		
 		for(ScheduledFuture<?> future : scheduledActions) {
 			future.cancel(false);
@@ -936,7 +935,7 @@ public class DHT implements DHTBase {
 		
 		long now = System.currentTimeMillis();
 		
-		serverManager.refresh(now);
+		serverManager.updateReachableEndpoints(now);
 		
 		if (!isRunning()) {
 			return;
@@ -1020,6 +1019,9 @@ public class DHT implements DHTBase {
 			CompletableFuture<RPCCall> f = new CompletableFuture<>();
 			
 			RPCServer srv = serverManager.getRandomActiveServer(true);
+			if(srv == null)
+				continue;
+			
 			c.addListener(new RPCCallListener() {
 				@Override
 				public void stateTransition(RPCCall c, RPCState previous, RPCState current) {
@@ -1199,7 +1201,12 @@ public class DHT implements DHTBase {
 		w.append(stats.toString());
 		w.append("-----------------------\n");
 		w.append("Routing table\n");
-		w.append(node.toString() + "\n");
+		try {
+			node.buildDiagnistics(w);
+		} catch (IOException e) {
+			throw new UncheckedIOException(e);
+		}
+		w.append('\n');
 		w.append("-----------------------\n");
 		w.append("RPC Servers\n");
 		for(RPCServer srv : serverManager.getAllServers())

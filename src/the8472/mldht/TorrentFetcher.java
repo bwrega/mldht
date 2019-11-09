@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.mldht;
 
 import lbms.plugins.mldht.kad.DHT;
@@ -50,6 +55,26 @@ import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import lbms.plugins.mldht.kad.DHT;
+import lbms.plugins.mldht.kad.KBucketEntry;
+import lbms.plugins.mldht.kad.Key;
+import lbms.plugins.mldht.kad.PeerAddressDBItem;
+import lbms.plugins.mldht.kad.RPCServer;
+import lbms.plugins.mldht.kad.DHT.LogLevel;
+import lbms.plugins.mldht.kad.tasks.PeerLookupTask;
+import lbms.plugins.mldht.kad.utils.AddressUtils;
+import lbms.plugins.mldht.kad.utils.ResponseTimeoutFilter;
+import lbms.plugins.mldht.utils.NIOConnectionManager;
+import the8472.bt.MetadataPool;
+import the8472.bt.MetadataPool.Completion;
+import the8472.bt.PullMetaDataConnection;
+import the8472.bt.PullMetaDataConnection.CONNECTION_STATE;
+import the8472.bt.PullMetaDataConnection.CloseReason;
+import the8472.bt.PullMetaDataConnection.MetaConnectionHandler;
+import the8472.bt.UselessPeerFilter;
+import the8472.utils.concurrent.LoggingScheduledThreadPoolExecutor;
+import the8472.utils.io.ConnectionAcceptor;
+
 public class TorrentFetcher {
 	
 	Collection<DHT> dhts;
@@ -61,7 +86,8 @@ public class TorrentFetcher {
 	AtomicInteger incomingConnections = new AtomicInteger();
 	AtomicInteger openConnections = new AtomicInteger();
 	Map<RPCServer, Set<Key>> activeLookups = new HashMap<>();
-	
+	ResponseTimeoutFilter tf = new ResponseTimeoutFilter();
+
 	List<FetchTask> tasks = new ArrayList<>();
 	
 	int maxOpen = 10;
@@ -80,6 +106,10 @@ public class TorrentFetcher {
 		this.maxSockets = maxHalfOpen;
 	}
 	
+	public String adaptiveConnectTimeoutHistogram() {
+		return tf.getCurrentStats().toString();
+	}
+
 	boolean incomingConnection(SocketChannel chan) {
 		PullMetaDataConnection con = new PullMetaDataConnection(chan);
 		
@@ -543,13 +573,12 @@ public class TorrentFetcher {
 				candidates.remove(addr);
 
 
-
-				
 				if(serverSelector != null && serverSelector.getPort() > 0)
 					con.ourListeningPort = serverSelector.getPort();
 				
 				con.keepPexOnlyOpen(closed.values().stream().filter(CONNECTION_STATE.STATE_PEX_ONLY::equals).count() < 20);
-				
+				con.setConnectTimeout(tf.getStallTimeout());
+
 				decorate(con);
 			
 				con.setListener(new MetaConnectionHandler() {
@@ -561,7 +590,12 @@ public class TorrentFetcher {
 						MetadataPool pool = con.getMetaData();
 						processPool(pool);
 
-							
+						if(con.chunksReceived() > 0) {
+							synchronized (tf) {
+								tf.updateAndRecalc(con.timeToConnect());
+							}
+						}
+
 						thingsBlockingCompletion.decrementAndGet();
 						if(pf != null)
 							pf.insert(con);
@@ -573,8 +607,10 @@ public class TorrentFetcher {
 							socketsIncludingHalfOpen.decrementAndGet();
 						}
 							
-						if(oldState == CONNECTION_STATE.STATE_CONNECTING && newState != CONNECTION_STATE.STATE_CLOSED)
+						if(oldState == CONNECTION_STATE.STATE_CONNECTING && newState != CONNECTION_STATE.STATE_CLOSED) {
 							openConnections.incrementAndGet();
+						}
+
 						if(oldState != CONNECTION_STATE.STATE_INITIAL && oldState != CONNECTION_STATE.STATE_CONNECTING && newState == CONNECTION_STATE.STATE_CLOSED)
 							openConnections.decrementAndGet();
 					};

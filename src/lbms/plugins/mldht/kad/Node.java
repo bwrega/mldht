@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad;
 
 import static java.lang.Math.max;
@@ -26,6 +15,7 @@ import static lbms.plugins.mldht.kad.Node.InsertOptions.REMOVE_IF_FULL;
 import static the8472.utils.Functional.typedGet;
 
 import the8472.bencode.BEncoder;
+import the8472.utils.AnonAllocator;
 import the8472.utils.CowSet;
 import the8472.utils.Pair;
 import the8472.utils.concurrent.SerializedTaskExecutor;
@@ -299,6 +289,12 @@ public class Node {
 		Optional<RPCCall> associatedCall = Optional.ofNullable(msg.getAssociatedCall());
 		Optional<Key> expectedId = associatedCall.map(RPCCall::getExpectedID);
 		Optional<Pair<KBucket, KBucketEntry>> entryByIp = bucketForIP(ip);
+		
+		// RPCServer only verifies IP equality for responses.
+		// we only want remote nodes with stable ports in our routing table, so appley a stricter check here
+		if(associatedCall.isPresent() && !associatedCall.filter(c -> c.getRequest().getDestination().equals(c.getResponse().getOrigin())).isPresent()) {
+			return;
+		}
 		
 		if(entryByIp.isPresent()) {
 			KBucket oldBucket = entryByIp.get().a;
@@ -664,7 +660,7 @@ public class Node {
 		
 		// don't spam the checks if we're not receiving anything.
 		// we don't want to cause too many stray packets somewhere in a network
-		if(survival && now - timeOfLastPingCheck > DHTConstants.BOOTSTRAP_MIN_INTERVAL)
+		if(survival && now - timeOfLastPingCheck < DHTConstants.BOOTSTRAP_MIN_INTERVAL)
 			return;
 		timeOfLastPingCheck = now;
 		
@@ -672,10 +668,9 @@ public class Node {
 		
 		int newEntryCount = 0;
 		
-		Map<InetAddress, KBucket> addressDedup = new HashMap<>(num_entries);
-		
 		for (RoutingTableEntry e : routingTableCOW.entries) {
 			KBucket b = e.bucket;
+			boolean isHome = e.homeBucket;
 
 			List<KBucketEntry> entries = b.getEntries();
 			
@@ -690,26 +685,25 @@ public class Node {
 					continue;
 				}
 				
-				// remove duplicate addresses. prefer to keep reachable entries
-				addressDedup.compute(entry.getAddress().getAddress(), (addr, oldBucket) -> {
-					if(oldBucket != null) {
-						KBucketEntry oldEntry = oldBucket.findByIPorID(addr, null).orElse(null);
-						if(oldEntry != null) {
-							if(oldEntry.verifiedReachable()) {
-								b.removeEntryIfBad(entry, true);
-								return oldBucket;
-							} else if(entry.verifiedReachable()) {
-								oldBucket.removeEntryIfBad(oldEntry, true);
-							}
+
+				// remove duplicate entries, keep the older one
+				RoutingTableEntry reverseMapping = knownNodes.get(entry.getAddress().getAddress());
+				if(reverseMapping != null && reverseMapping != e) {
+					KBucket otherBucket = reverseMapping.getBucket();
+					KBucketEntry other = otherBucket.findByIPorID(entry.getAddress().getAddress(), null).orElse(null);
+					if(other != null && !other.equals(entry)) {
+						if(other.getCreationTime() < entry.getCreationTime()) {
+							b.removeEntryIfBad(entry, true);
+						} else {
+							otherBucket.removeEntryIfBad(other, true);
 						}
 					}
-					return b;
-				});
+				}
 				
 			}
 			
 			boolean refreshNeeded = b.needsToBeRefreshed();
-			boolean replacementNeeded = b.needsReplacementPing();
+			boolean replacementNeeded = b.needsReplacementPing() || (isHome && b.findPingableReplacement().isPresent());
 			if(refreshNeeded || replacementNeeded)
 				tryPingMaintenance(b, "Refreshing Bucket #" + e.prefix, null, (task) -> {
 					task.probeUnverifiedReplacement(replacementNeeded);
@@ -757,6 +751,7 @@ public class Node {
 	}
 	
 	
+	// TODO implement merges for non-home buckets that got split in the past
 	void mergeBuckets() {
 			
 		int i = 0;
@@ -895,20 +890,21 @@ public class Node {
 		if(!Files.isDirectory(saveTo.getParent()))
 			return;
 		
-		ByteBuffer tableBuffer = ByteBuffer.allocateDirect(50*1024*1024);
+		Key currentRootID = getRootID();
+		
+		// called in an uninitialized state, no point in overwriting the table
+		if(currentRootID == null)
+			return;
+		
+		ByteBuffer tableBuffer = AnonAllocator.allocate(50*1024*1024);
 		
 		
 		Map<String,Object> tableMap = new TreeMap<>();
 
 		RoutingTable table = routingTableCOW;
 		
-		List<Map<String, Object>> main = new ArrayList<>();
-		List<Map<String, Object>> replacements = new ArrayList<>();
-		
-		table.stream().map(RoutingTableEntry::getBucket).forEach(b -> {
-			b.entriesStream().map(KBucketEntry::toBencoded).collect(Collectors.toCollection(() -> main));
-			b.getReplacementEntries().stream().map(KBucketEntry::toBencoded).collect(Collectors.toCollection(() -> replacements));
-		});
+		Stream<Map<String, Object>> main = table.stream().map(RoutingTableEntry::getBucket).flatMap(b -> b.entriesStream().map(KBucketEntry::toBencoded));
+		Stream<Map<String, Object>> replacements = table.stream().map(RoutingTableEntry::getBucket).flatMap(b -> b.replacementsStream().map(KBucketEntry::toBencoded));
 		
 		tableMap.put("mainEntries", main);
 		tableMap.put("replacements", replacements);
@@ -918,13 +914,13 @@ public class Node {
 		tableMap.put("log2estimate", doubleBuf);
 		
 		tableMap.put("timestamp", System.currentTimeMillis());
-		tableMap.put("oldKey", getRootID().getHash());
+		tableMap.put("oldKey", currentRootID.getHash());
 		
 		new BEncoder().encodeInto(tableMap, tableBuffer);
 		
 		Path tempFile = Files.createTempFile(saveTo.getParent(), "saveTable", "tmp");
 		
-		try(SeekableByteChannel chan = Files.newByteChannel(tempFile, StandardOpenOption.WRITE, StandardOpenOption.SYNC)) {
+		try(SeekableByteChannel chan = Files.newByteChannel(tempFile, StandardOpenOption.WRITE)) {
 			chan.write(tableBuffer);
 			chan.close();
 			Files.move(tempFile, saveTo, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
@@ -1086,19 +1082,36 @@ public class Node {
 	@Override
 	public String toString() {
 		StringBuilder b = new StringBuilder(10000);
+
+		try {
+			buildDiagnistics(b);
+		} catch (IOException e) {
+			throw new Error("should not happen");
+		}
+			
+		return b.toString();
+	}
+	
+	public void buildDiagnistics(Appendable b) throws IOException {
 		RoutingTable table = routingTableCOW;
 		
 		Collection<Key> localIds = localIDs();
 		
-		b.append("buckets: ").append(table.size()).append(" / entries: ").append(num_entries).append('\n');
+		b.append("buckets: ");
+		b.append(String.valueOf(table.size()));
+		b.append(" / entries: ");
+		b.append(String.valueOf(num_entries));
+		b.append('\n');
 		for(RoutingTableEntry e : table.entries) {
-			b.append(e.prefix).append("   num:").append(e.bucket.getNumEntries()).append(" rep:").append(e.bucket.getNumReplacements());
+			b.append(e.prefix.toString());
+			b.append("   num:");
+			b.append(String.valueOf(e.bucket.getNumEntries()));
+			b.append(" rep:");
+			b.append(String.valueOf(e.bucket.getNumReplacements()));
 			if(localIds.stream().anyMatch(e.prefix::isPrefixOf))
 				b.append(" [Home]");
 			b.append('\n');
 		}
-			
-		return b.toString();
 	}
 
 }

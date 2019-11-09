@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.bt;
 
 import the8472.bencode.BDecoder;
@@ -29,6 +18,8 @@ import lbms.plugins.mldht.kad.utils.AddressUtils;
 import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
 import lbms.plugins.mldht.utils.NIOConnectionManager;
 import lbms.plugins.mldht.utils.Selectable;
+
+import static the8472.bencode.Utils.stripToAscii;
 import static the8472.bt.PullMetaDataConnection.CONNECTION_STATE.*;
 import java.io.IOException;
 import java.net.Inet4Address;
@@ -127,6 +118,7 @@ public class PullMetaDataConnection implements Selectable {
 	boolean						remoteSupportsPort;
 	int							ltepRemoteMetadataExchangeMessageId;
 	int							ltepRemotePexId = -1;
+	byte[]						remotePeerId = new byte[20];
 	public int					dhtPort = -1;
 	public int					ourListeningPort = -1;
 	
@@ -137,13 +129,16 @@ public class PullMetaDataConnection implements Selectable {
 
 	int							outstandingRequests;
 	int							maxRequests = 1;
+	int							chunksReceived = 0;
 	
+	long						connectionOpenTime;
+	long						connectTime;
 	long						lastReceivedTime;
 	long						lastUsefulMessage;
+	long						connectTimeout = 5 * 1000;
 	
 	AtomicReference<CONNECTION_STATE> 			state = new AtomicReference<>(STATE_INITIAL) ;
 	
-	BDecoder					decoder = new BDecoder();
 	MetaConnectionHandler		metaHandler;
 	
 	InetSocketAddress			remoteAddress;
@@ -195,11 +190,24 @@ public class PullMetaDataConnection implements Selectable {
 		metaHandler = handler;
 	}
 	
+	public void setConnectTimeout(long t) {
+		connectTimeout = t;
+	}
+	
+	public long timeToConnect() {
+		return connectTime - connectionOpenTime;
+	}
+	
+	public int chunksReceived() {
+		return chunksReceived;
+	}
+	
 	// incoming
 	public PullMetaDataConnection(SocketChannel chan)
 	{
 		channel = chan;
 		incoming = true;
+		connectionOpenTime = System.currentTimeMillis();
 
 		try
 		{
@@ -255,6 +263,7 @@ public class PullMetaDataConnection implements Selectable {
 
 		if(isState(STATE_CONNECTING))
 		{
+			connectionOpenTime = System.currentTimeMillis();
 			try {
 				if(channel.connect(remoteAddress))
 					connectEvent();
@@ -299,6 +308,7 @@ public class PullMetaDataConnection implements Selectable {
 		try {
 			if(channel.isConnectionPending() && channel.finishConnect())
 			{
+				connectTime = System.currentTimeMillis();
 				if(!setState(STATE_CONNECTING, STATE_BASIC_HANDSHAKING))
 					return;
 				connManager.interestOpsChanged(this);
@@ -354,8 +364,8 @@ public class PullMetaDataConnection implements Selectable {
 
 
 			// check peer ID
-			inputBuffer.get(temp);
-			if(temp[0] == '-' && temp[1] == 'S' && temp[2] == 'D' && temp[3] == '0' && temp[4] == '1' && temp[5] == '0' &&  temp[6] == '0' && temp[7] == '-') {
+			inputBuffer.get(remotePeerId);
+			if(remotePeerId[0] == '-' && remotePeerId[1] == 'S' && remotePeerId[2] == 'D' && remotePeerId[3] == '0' && remotePeerId[4] == '1' && remotePeerId[5] == '0' &&  remotePeerId[6] == '0' && remotePeerId[7] == '-') {
 				terminate("xunlei doesn't support ltep", CloseReason.NO_LTEP);
 			}
 				
@@ -393,13 +403,14 @@ public class PullMetaDataConnection implements Selectable {
 			handshakeHeader.flip();
 			outputBuffers.addLast(handshakeHeader);
 			outputBuffers.addLast(handshakeBody);
-			/*
+			
 			if(remoteSupportsFastExtension) {
 				ByteBuffer haveNone = ByteBuffer.allocate(5);
 				haveNone.put(3, (byte) 1);
 				haveNone.put(4, (byte) 0x0f);
 				outputBuffers.addLast(haveNone);
 			}
+			/*
 			if(remoteSupportsPort && dhtPort != -1) {
 				ByteBuffer btPort = ByteBuffer.allocate(7);
 				btPort.putInt(3);
@@ -458,6 +469,9 @@ public class PullMetaDataConnection implements Selectable {
 
 		// read BT msg ID
 		int btMsgID = inputBuffer.get() & 0xFF;
+		
+		//System.out.println("btmsg" + btMsgID);
+		
 		if(btMsgID == LTEP_HEADER_ID)
 		{
 			// read LTEP msg ID
@@ -469,10 +483,9 @@ public class PullMetaDataConnection implements Selectable {
 				
 				lastUsefulMessage = System.currentTimeMillis();
 				
-				BDecoder decoder = new BDecoder();
 				Map<String,Object> remoteHandshake;
 				try {
-					remoteHandshake = decoder.decode(inputBuffer);
+					remoteHandshake = ThreadLocalUtils.getDecoder().decode(inputBuffer);
 				} catch (BDecodingException ex) {
 					terminate("invalid bencoding in ltep handshake", CloseReason.OTHER);
 					return;
@@ -556,6 +569,7 @@ public class PullMetaDataConnection implements Selectable {
 				if(type == 1)
 				{ // piece
 					outstandingRequests--;
+					chunksReceived++;
 					
 					ByteBuffer chunk = AnonAllocator.allocate(inputBuffer.remaining());
 					chunk.put(inputBuffer);
@@ -569,6 +583,10 @@ public class PullMetaDataConnection implements Selectable {
 				{ // reject
 					pool.releasePiece(idx.intValue());
 					terminate("request was rejected");
+					return;
+				} else if(type == 0) {
+					// remote is requesting from us? makes no sense
+					terminate("remote requesting metadata, but we're looking for it ourselves");
 					return;
 				}
 			}
@@ -702,6 +720,12 @@ public class PullMetaDataConnection implements Selectable {
 		// hash check may have finished or failed due to other pool members
 		checkMetaRequests();
 		
+		if(state.get() == STATE_CONNECTING && now - connectionOpenTime > connectTimeout) {
+			terminate("connect timeout", CloseReason.CONNECT_FAILED);
+			return;
+		}
+			
+		
 		long timeSinceUsefulMessage = now - lastUsefulMessage;
 		long age = now - lastReceivedTime;
 		
@@ -729,9 +753,10 @@ public class PullMetaDataConnection implements Selectable {
 			
 			channel.close();
 			
-			DHT.log(String.format("closing pull connection inc: %b reason: %s flag: %s state: %s ", incoming, reasonStr, reason, oldState), LogLevel.Debug);
-			
-			
+			if(DHT.isLogLevelEnabled(LogLevel.Debug)) {
+				String closemsg = String.format("closing pull connection inc: %b reason: %s flag: %s state: %s pid: %s fast: %b age: %d", incoming, reasonStr, reason, oldState, stripToAscii(remotePeerId), remoteSupportsFastExtension, System.currentTimeMillis() - connectionOpenTime);
+				DHT.log(closemsg , LogLevel.Debug);
+			}
 		}
 	}
 	

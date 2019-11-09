@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad;
 
 import java.nio.charset.StandardCharsets;
@@ -66,14 +55,19 @@ public class DHTConstants {
 	public static final int		ANNOUNCE_CACHE_MAX_AGE					= 30 * 60 * 1000;
 	public static final int		ANNOUNCE_CACHE_FAST_LOOKUP_AGE			= 8 * 60 * 1000;
 
-	private static String version = "AZ00";
+	private static String version = null;
 
 	public static String getVersion() {
 		return version;
 	}
 
 	public static void setVersion (int ver) {
-		version = "Az" + new String(new byte[] { (byte) (ver >> 8 & 0xFF) , (byte) (ver & 0xff) }, StandardCharsets.ISO_8859_1);
+		version = "ml" + new String(new byte[] { (byte) (ver >> 8 & 0xFF) , (byte) (ver & 0xff) }, StandardCharsets.ISO_8859_1);
+	}
+
+	static {
+		// 0.1.1
+		setVersion(11);
 	}
 
 }

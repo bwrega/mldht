@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.utils;
 
 import java.nio.ByteBuffer;
@@ -58,22 +47,15 @@ public final class BitVector {
 	 * reads an arbitrary (even non-aligned) range of bits (up to 32) and interprets them as int (bigendian)
 	 */
 	public int rangeToInt(int bitOffset, int numOfBits) {
-		int result = 0;
-		int baseShift = numOfBits - 8 + bitOffset % 8;
-		int byteIdx = bitOffset/8;
-		while(baseShift >= 0)
-		{
-			result |= vector[byteIdx] << baseShift;
-			byteIdx++;
-			baseShift -= 8;
-		}
+		ByteBuffer vec = ByteBuffer.wrap(this.vector);
+		int offset = Math.min(this.vector.length - 9, bitOffset / 8);
+		int tailOffset = (bitOffset / 8) - offset;
+		long l = vec.getLong(offset);
 		
-		if(baseShift < 0)
-			result |= vector[byteIdx] >>> Math.abs(baseShift);
+		l <<= bitOffset % 8 + tailOffset * 8;
+		l >>>= 64 - numOfBits;
 		
-		result &= 0xFFFFFFFF >>> 32 - numOfBits;
-		
-		return result;
+		return (int) l;
 	}
 	
 	public int size() {

@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.bencode;
 
 import static the8472.bencode.Utils.str2buf;
@@ -52,7 +57,7 @@ public class BEncoder {
 			encodeMap((Map<String, Object>) o);
 			return;
 		}
-		
+
 		if(o instanceof List) {
 			encodeList((List<Object>) o);
 			return;
@@ -102,9 +107,21 @@ public class BEncoder {
 			w.writeTo(buf);
 			return;
 		}
+
+		if(o instanceof Stream) {
+			encodeStream((Stream<Object>) o);
+			return;
+		}
 		
 		throw new RuntimeException("unknown object to encode " + o);
 	}
+
+	private void encodeStream(Stream<Object> l) {
+		buf.put((byte) 'l');
+		l.forEach(this::encodeInternal);
+		buf.put((byte) 'e');
+	}
+
 	
 	private void encodeList(List<Object> l) {
 		buf.put((byte) 'l');

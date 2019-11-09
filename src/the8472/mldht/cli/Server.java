@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.mldht.cli;
 
 import java.io.IOException;
@@ -177,20 +182,22 @@ public class Server implements Component {
 				}
 				
 				void write() throws IOException {
-					ByteBuffer toWrite;
-					while((toWrite = writes.pollFirst()) != null) {
-						try {
-							chan.write(toWrite);
-						} catch (IOException e) {
-							chan.close();
-							return;
+					try {
+						while (!writes.isEmpty()) {
+							if (!writes.peekFirst().hasRemaining()) {
+								writes.removeFirst();
+								continue;
+							}
+							long written = chan.write(writes.stream().toArray(ByteBuffer[]::new));
+							if (written == 0)
+								break;
+
 						}
-						if(toWrite.remaining() > 0) {
-							writes.addFirst(toWrite);
-							break;
-						}
+					} catch (IOException e) {
+						chan.close();
+						return;
 					}
-					
+
 					if(writes.isEmpty())
 						conMan.interestOpsChanged(this);
 				}

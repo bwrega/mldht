@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.utils;
 
 import java.io.IOException;
@@ -25,14 +30,13 @@ public class AnonAllocator {
 			Files.delete(p);
 			result = mapped.get() == 0;
 		} catch (IOException e) {
-			e.printStackTrace();
 			if(p != null) {
 				Path toDelete = p;
 				Runtime.getRuntime().addShutdownHook(new Thread(() -> {
 					try {
 						Files.deleteIfExists(toDelete);
 					} catch (IOException e1) {
-						e1.printStackTrace();
+						System.err.println("could not delete tempfile "  + toDelete + ", most likely cause: garbage collector did not free the memory mapping keeping it open ; " + e1.getMessage());
 					}
 				}));
 

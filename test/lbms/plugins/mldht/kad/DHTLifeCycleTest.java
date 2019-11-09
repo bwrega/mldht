@@ -1,11 +1,20 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad;
 
 import lbms.plugins.mldht.DHTConfiguration;
 import lbms.plugins.mldht.kad.DHT.DHTtype;
 import lbms.plugins.mldht.kad.DHT.LogLevel;
+import lbms.plugins.mldht.kad.messages.PingRequest;
+import lbms.plugins.mldht.kad.utils.AddressUtils;
 import org.junit.Test;
 
 import java.lang.Thread.UncaughtExceptionHandler;
+import java.net.Inet4Address;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
@@ -14,12 +23,16 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledThreadPoolExecutor;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Predicate;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotEquals;
 import static org.junit.Assert.assertTrue;
 
 public class DHTLifeCycleTest {
@@ -118,31 +131,40 @@ public class DHTLifeCycleTest {
 		
 		RPCServer srv = dhtInstance.getServerManager().getRandomServer();
 
-		scheduler.submit(() -> {
-			try {
-				assertEquals(RPCServer.State.RUNNING, srv.getState());
-				// fake a packet to trigger liveness update
-				DatagramChannel chan = DatagramChannel.open();
-				chan.connect(new InetSocketAddress(srv.getBindAddress(), srv.getPort()));
-				ByteBuffer packet = ByteBuffer.allocate(50);
-				packet.put(0, (byte) 'd');
-				chan.write(packet);
+		CompletableFuture<Void> gotPing = new CompletableFuture<>();
 
-				srv.sel.readEvent();
-
-				CompletableFuture<RPCServer> cf = dhtInstance.getServerManager().awaitActiveServer().toCompletableFuture();
-
-				dhtInstance.getServerManager().refresh(System.currentTimeMillis());
-
-				assertEquals(srv, cf.get(500, TimeUnit.MILLISECONDS));
-
-			} catch(Exception e) {
-				exceptionCanary.completeExceptionally(e);
+		dhtInstance.addIncomingMessageListener((instance, msg) -> {
+			if(msg instanceof PingRequest) {
+				gotPing.complete(null);
 			}
-		}).get();
+		});
 
-		CompletableFuture<Boolean> wasEmpty = new CompletableFuture<>();
+		scheduler.submit(() -> {
+			assertEquals(RPCServer.State.RUNNING, srv.getState());
+		}).get(800, TimeUnit.MILLISECONDS);
+
+
+		DatagramChannel chan = DatagramChannel.open();
+		chan.connect(new InetSocketAddress(srv.getBindAddress(), srv.getPort()));
+		// fake a packet to trigger liveness update
+		ByteBuffer packet = ByteBuffer.allocate(100);
+		PingRequest r = new PingRequest();
+		r.setMTID(new byte[4]);
+		r.setID(Key.createRandomKey());
+		r.encode(packet);
+		int packetSize = packet.limit();
+		assertTrue("sanity check: packet serialization", packetSize > 0);
+		assertEquals("sanity check: sent test packet", packetSize, chan.write(packet));
+		gotPing.get(500, TimeUnit.MILLISECONDS);
+		assertEquals(1, srv.getNumReceived());
+
+		CompletableFuture<RPCServer> cf = dhtInstance.getServerManager().awaitActiveServer().toCompletableFuture();
+		dhtInstance.getServerManager().startNewServers();
+		dhtInstance.getServerManager().updateReachableEndpoints(System.currentTimeMillis());
+		assertEquals(srv, cf.get(500, TimeUnit.MILLISECONDS));
+
 		
+		CompletableFuture<Boolean> wasEmpty = new CompletableFuture<>();
 		// single-threaded executor -> we can let startup tasks complete and then stop the DHT from the pool itself
 		// thus there should be no pending tasks on the executor
 		scheduler.submit(() -> {
@@ -157,7 +179,8 @@ public class DHTLifeCycleTest {
 		
 		assertEquals(DHTStatus.Stopped, dhtInstance.getStatus());
 		
-		assertEquals("no messages should have been sent on a bootstrapless startup", 0, dhtInstance.getStats().getNumSentPackets());
+		assertEquals("expected to receive only 1 message (the crafted ping)", 1, srv.getNumReceived());
+		assertEquals("expected to only send 1 message (reply to that ping)", 1, srv.getNumSent());
 		
 		scheduler.shutdown();
 		
@@ -170,8 +193,74 @@ public class DHTLifeCycleTest {
 		
 		assertFalse("should not create storage path, that's the caller's duty", Files.isDirectory(storagePath));
 
-		dhtInstance.stop();
+    dhtInstance.stop();
+  }
 
+	@Test
+	public void testBindFilter() {
+		DHT dht = NodeFactory.buildDHT(DHTtype.IPV4_DHT);
+		dht.getNode().initKey(null);
+		dht.setScheduler(Executors.newSingleThreadScheduledExecutor());
+		AtomicReference<Predicate<InetAddress>> predicate = new AtomicReference<>(null);
+
+		dht.config = new DHTConfiguration() {
+
+			@Override
+			public boolean noRouterBootstrap() {
+				return true;
+			}
+
+			@Override
+			public boolean isPersistingID() {
+				// TODO Auto-generated method stub
+				return false;
+			}
+
+			@Override
+			public Path getStoragePath() {
+				// TODO Auto-generated method stub
+				return null;
+			}
+
+			@Override
+			public int getListeningPort() {
+				// TODO Auto-generated method stub
+				return 0;
+			}
+
+			@Override
+			public boolean allowMultiHoming() {
+				return false;
+			}
+
+			@Override
+			public Predicate<InetAddress> filterBindAddress() {
+				return predicate.get();
+			}
+		};
+
+		predicate.set((unused) -> true);
+		RPCServerManager srvman = dht.getServerManager();
+		srvman.startNewServers();
+		assertNotEquals(0, srvman.getServerCount());
+
+		predicate.set((unused) -> false);
+		srvman.doBindChecks();
+		assertEquals(0, srvman.getServerCount());
+
+		// wildcard addr same as allowing all addresses of that family
+		predicate.set((addr) -> addr instanceof Inet4Address && addr.isAnyLocalAddress());
+		srvman.startNewServers();
+		assertNotEquals(0, srvman.getServerCount());
+
+		// select a specific address
+		InetAddress localAddr = AddressUtils.nonlocalAddresses().filter(Inet4Address.class::isInstance).findAny().get();
+		predicate.set((addr) -> addr.equals(localAddr));
+		srvman.doBindChecks();
+		srvman.startNewServers();
+		assertEquals(localAddr, srvman.getAllServers().get(0).getBindAddress());
+
+		
 	}
 
 }

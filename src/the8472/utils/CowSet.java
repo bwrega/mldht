@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package the8472.utils;
 
 import java.util.Collection;
@@ -64,11 +69,15 @@ public class CowSet<E> implements Set<E> {
 
 	@Override
 	public boolean add(E e) {
+		if(backingStore.containsKey(e))
+			return false;
 		return update(m -> m.putIfAbsent(e, Boolean.TRUE) == null);
 	}
 
 	@Override
 	public boolean remove(Object o) {
+		if(!backingStore.containsKey(o))
+			return false;
 		return update(m -> m.keySet().remove(o));
 	}
 
@@ -79,7 +88,13 @@ public class CowSet<E> implements Set<E> {
 
 	@Override
 	public boolean addAll(Collection<? extends E> c) {
-		throw new UnsupportedOperationException("not implemented");
+		return update(m -> {
+			boolean added = false;
+			for (E e : c) {
+				added |= m.put(e, Boolean.TRUE) == null;
+			}
+			return added;
+		});
 	}
 
 	@Override

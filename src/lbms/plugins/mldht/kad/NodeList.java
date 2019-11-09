@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad;
 
 import static the8472.utils.Functional.unchecked;
@@ -10,6 +15,8 @@ import java.util.stream.IntStream;
 import java.util.stream.Stream;
 
 import lbms.plugins.mldht.kad.DHT.DHTtype;
+import lbms.plugins.mldht.kad.utils.AddressUtils;
+
 import the8472.bencode.BEncoder.StringWriter;
 
 public interface NodeList {
@@ -70,7 +77,7 @@ public interface NodeList {
 					buf.get(rawAddr);
 					int port = Short.toUnsignedInt(buf.getShort());
 					
-					InetAddress addr = unchecked(() -> InetAddress.getByAddress(rawAddr));
+					InetAddress addr = unchecked(() -> AddressUtils.fromBytesVerbatim(rawAddr));
 					Key id = new Key(rawId);
 					
 					return new KBucketEntry(unchecked(() -> new InetSocketAddress(addr, port)), id);

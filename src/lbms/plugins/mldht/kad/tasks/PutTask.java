@@ -1,3 +1,8 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.tasks;
 
 import lbms.plugins.mldht.kad.DHTConstants;
@@ -7,17 +12,20 @@ import lbms.plugins.mldht.kad.Node;
 import lbms.plugins.mldht.kad.RPCCall;
 import lbms.plugins.mldht.kad.RPCServer;
 import lbms.plugins.mldht.kad.messages.MessageBase;
+import lbms.plugins.mldht.kad.messages.MessageBase.Method;
+import lbms.plugins.mldht.kad.messages.MessageBase.Type;
 import lbms.plugins.mldht.kad.messages.PutRequest;
 
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class PutTask extends TargetedTask {
 	
 	NavigableMap<KBucketEntry, byte[]> todo;
 	StorageItem toPut;
-	
+	AtomicInteger accepted = new AtomicInteger();
 	
 	
 	public PutTask(RPCServer rpc, Node node, Map<KBucketEntry, byte[]> candidatesAndTokens, StorageItem it) {
@@ -64,7 +72,14 @@ public class PutTask extends TargetedTask {
 
 	@Override
 	void callFinished(RPCCall c, MessageBase rsp) {
-		// TODO Auto-generated method stub
+		if(rsp.getMethod() != Method.PUT || rsp.getType() != Type.RSP_MSG)
+			return;
+		if(!c.matchesExpectedID())
+			return;
+		// strict port check
+		if(!c.getRequest().getDestination().equals(rsp.getOrigin()))
+			return;
+		accepted.incrementAndGet();
 	}
 
 	@Override
@@ -80,7 +95,7 @@ public class PutTask extends TargetedTask {
 
 	@Override
 	protected boolean isDone() {
-		if(getRecvResponses() >= DHTConstants.MAX_ENTRIES_PER_BUCKET)
+		if(accepted.get() >= DHTConstants.MAX_ENTRIES_PER_BUCKET)
 			return true;
 		if(todo.isEmpty() && getNumOutstandingRequests() == 0)
 			return true;

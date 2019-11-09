@@ -1,43 +1,65 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht;
 
+import lbms.plugins.mldht.kad.DHT;
+
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.file.Path;
+import java.util.function.Predicate;
 
 public interface DHTConfiguration {
 	
+	/**
+	 * if true and combined with an existing storage directory the base ID from which individual RPCServer IDs are derived will be returned
+	 */
 	public boolean isPersistingID();
 
+	/**
+	 * If a Path that points to an existing, writable directory is returned then the routing table
+	 * will be persisted to that directory periodically and during shutdown
+	 */
 	public Path getStoragePath();
 
 	public int getListeningPort();
 	
+	/**
+	 * if true then no attempt to bootstrap through well-known nodes is made.
+	 * you either must have a persisted routing table which can be loaded or
+	 * manually seed the routing table by calling {@link DHT#addDHTNode(String, int)}
+	 */
 	public boolean noRouterBootstrap();
-	
-	public boolean allowMultiHoming();
 
-	default InetSocketAddress[] getUnresolvedBootstrapNodes() {
-		return new InetSocketAddress[]{
-			InetSocketAddress.createUnresolved("dht.transmissionbt.com", 6881),
-			InetSocketAddress.createUnresolved("router.bittorrent.com", 6881),
-			InetSocketAddress.createUnresolved("router.utorrent.com", 6881),
-			InetSocketAddress.createUnresolved("router.silotis.us", 6881),
-		};
+	/**
+	 * If true one DHT node per globally routable unicast address will be used. Recommended for IPv6 nodes or servers-class machines directly connected to the internet.<br>
+	 * If false only one node will be bound. Usually to the the default route. Recommended for IPv4 nodes.
+	 */
+	public boolean allowMultiHoming();
+	
+	/**
+	 * A DHT node will automatically select socket bind addresses based on internal policies from available addresses,
+	 * the predicate can be used to limit this selection to a subset.
+	 *
+	 * A predicate that allows the <em>any local address</em> of a particular address family is considered to allow all addresses <em>of that family</em>
+	 *
+	 * The default implementation does not apply any restrictions.
+	 *
+	 * The predicate may be be evaluated frequently, implementations should be approximately constant-time.
+	 */
+	public default Predicate<InetAddress> filterBindAddress() {
+		return (unused) -> true;
 	}
 
+  default InetSocketAddress[] getUnresolvedBootstrapNodes() {
+    return new InetSocketAddress[]{
+      InetSocketAddress.createUnresolved("dht.transmissionbt.com", 6881),
+      InetSocketAddress.createUnresolved("router.bittorrent.com", 6881),
+      InetSocketAddress.createUnresolved("router.utorrent.com", 6881),
+      InetSocketAddress.createUnresolved("router.silotis.us", 6881),
+    };
+  }
 }

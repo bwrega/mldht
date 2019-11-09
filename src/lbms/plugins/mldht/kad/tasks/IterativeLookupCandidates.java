@@ -1,6 +1,13 @@
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.tasks;
 
 import static java.lang.Math.max;
+
+import the8472.utils.CowSet;
 
 import lbms.plugins.mldht.kad.IDMismatchDetector;
 import lbms.plugins.mldht.kad.KBucketEntry;
@@ -11,6 +18,7 @@ import lbms.plugins.mldht.kad.RPCState;
 import lbms.plugins.mldht.kad.SpamThrottle;
 
 import java.net.InetAddress;
+import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -46,7 +54,9 @@ import java.util.stream.Stream;
  * 
  * -> we can recover from all the above-listed issues because the terminal set of nodes should have some partial agreement about their neighbors
  * 
- * 
+ * TODO:
+ *  - global mutual exclusion for in-flight targets. bad peers polluting everyone's routing table are the #1 slowdown for bulk lookups now
+ *  - min-heaps (active + penalty box)? assign score once. recalculate as needed
  * 
  */
 public class IterativeLookupCandidates {
@@ -66,7 +76,7 @@ public class IterativeLookupCandidates {
 	class LookupGraphNode {
 		final KBucketEntry e;
 		Set<LookupGraphNode> sources = new CopyOnWriteArraySet<>();
-		Set<LookupGraphNode> returnedNodes = ConcurrentHashMap.newKeySet();
+		Set<LookupGraphNode> returnedNodes = new CowSet<>();
 		List<RPCCall> calls = new CopyOnWriteArrayList<>();
 		boolean tainted;
 		boolean acceptedResponse;
@@ -92,11 +102,11 @@ public class IterativeLookupCandidates {
 		}
 		
 		int nonSuccessfulDescendantCalls() {
-			return (int) Math.ceil(returnedNodes.stream().filter(LookupGraphNode::callsNotSuccessful).mapToDouble(node -> 1.0 / Math.max(node.sources.size(), 1)).sum());
+			return (int) Math.ceil(returnedNodes.isEmpty() ? 0 : returnedNodes.stream().filter(LookupGraphNode::callsNotSuccessful).mapToDouble(node -> 1.0 / Math.max(node.sources.size(), 1)).sum());
 		}
 		
-		void addChild(LookupGraphNode toAdd) {
-			returnedNodes.add(toAdd);
+		void addChildren(Collection<LookupGraphNode> toAdd) {
+			returnedNodes.addAll(toAdd);
 		}
 		
 		KBucketEntry toKbe() {
@@ -191,6 +201,8 @@ public class IterativeLookupCandidates {
 		
 		LookupGraphNode sourceNode = source != null ? candidates.get(source) : null;
 		
+		List<LookupGraphNode> children = new ArrayList<>();
+		
 		for(KBucketEntry e : entries) {
 			if(!dedup.add(e.getID()) || !dedup.add(e.getAddress().getAddress()))
 				continue;
@@ -218,12 +230,13 @@ public class IterativeLookupCandidates {
 				return node;
 			});
 			
-			if(sourceNode != null)
-				sourceNode.addChild(newNode);
-
+			children.add(newNode);
 			
 		}
 		
+		if(sourceNode != null)
+			sourceNode.addChildren(children);
+
 		
 	}
 	
@@ -278,7 +291,7 @@ public class IterativeLookupCandidates {
 			return false;
 
 		// skip retransmits if we previously got a response but from the wrong socket address
-		if(node.calls.stream().anyMatch(RPCCall::hasSocketMismatch))
+		if(!node.calls.isEmpty() && node.calls.stream().anyMatch(RPCCall::hasSocketMismatch))
 			return false;
 		
 		

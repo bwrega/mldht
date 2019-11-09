@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.messages;
 
 import static the8472.bencode.Utils.buf2ary;
@@ -65,7 +54,7 @@ public class GetPeersResponse extends AbstractLookupResponse {
 	public Map<String, Object> getInnerMap() {
 		Map<String, Object> innerMap = super.getInnerMap();
 		if(items != null && !items.isEmpty()) {
-			List<byte[]> itemsList = new ArrayList<byte[]>(items.size());
+			List<byte[]> itemsList = new ArrayList<>(items.size());
 			for (DBItem item : items) {
 				itemsList.add(item.getData());
 			}
@@ -91,7 +80,7 @@ public class GetPeersResponse extends AbstractLookupResponse {
 	
 	public BloomFilterBEP33 getScrapeSeeds() {
 		if(scrapeSeeds != null)
-			return new BloomFilterBEP33(buf2ary(scrapeSeeds));
+			return new BloomFilterBEP33(buf2ary(scrapeSeeds.duplicate()));
 		return null;
 	}
 
@@ -102,11 +91,15 @@ public class GetPeersResponse extends AbstractLookupResponse {
 	public void setScrapeSeeds(BloomFilterBEP33 scrapeSeeds) {
 		this.scrapeSeeds = scrapeSeeds != null ? scrapeSeeds.toBuffer() : null;
 	}
+	
+	public boolean hasScrapeResults() {
+		return this.scrapePeers != null || this.scrapeSeeds != null;
+	}
 
 
 	public BloomFilterBEP33 getScrapePeers() {
 		if(scrapePeers != null)
-			return new BloomFilterBEP33(buf2ary(scrapePeers));
+			return new BloomFilterBEP33(buf2ary(scrapePeers.duplicate()));
 		return null;
 	}
 

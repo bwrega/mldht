@@ -1,27 +1,20 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.indexer.utils;
 
 import java.nio.ByteBuffer;
 import java.security.MessageDigest;
+import java.util.concurrent.ThreadLocalRandom;
+
 import lbms.plugins.mldht.kad.utils.BitVector;
 import lbms.plugins.mldht.kad.utils.ThreadLocalUtils;
 
 import static java.lang.Math.*;
+
+import the8472.utils.MathUtils;
 
 
 public class GenericBloomFilter implements Cloneable {
@@ -36,9 +29,19 @@ public class GenericBloomFilter implements Cloneable {
 	private final int hashBits;
 	
 	BitVector filter;
-
-
 	
+	byte[] secret;
+
+
+	static GenericBloomFilter withProbability(int n, float p) {
+		if(p <= 0.0 || p >= 1.0) {
+			throw new IllegalArgumentException("p must be in (0.0,1.0 range");
+		}
+		int m = (int) (-n*Math.log(p) / Math.pow(Math.log(2),2));
+		// next power of 2
+		m = Math.max(1, Integer.highestOneBit(m - 1) << 1);
+		return new GenericBloomFilter(m, n);
+	}
 	
 	public GenericBloomFilter(int m, int n) {
 		if(Long.bitCount(m) != 1)
@@ -48,26 +51,44 @@ public class GenericBloomFilter implements Cloneable {
 		k = (int) Math.max(1, Math.round(m * 1.0 / n * Math.log(2)));
 		hashBits = (int) (Math.log(m)/Math.log(2));
 		filter = new BitVector(m);
+		secret = new byte[4];
+		ThreadLocalRandom.current().nextBytes(secret);
 	}
 	
 	
-	public void insert(ByteBuffer data) {
+	public boolean insert(ByteBuffer data) {
+		BitVector hash = keysForData(data);
+		boolean changed = false;
+		for(int i=0;i<k;i++) {
+			int idx = hash.rangeToInt(i*hashBits, hashBits);
+			changed |= !filter.get(idx);
+			filter.set(idx);
+		}
+		return changed;
+	}
+	
+	BitVector keysForData(ByteBuffer buf) {
 		MessageDigest sha1 = ThreadLocalUtils.getThreadLocalSHA1();
 		sha1.reset();
-		sha1.update(data);
-		BitVector hash = new BitVector(160, sha1.digest());
-		sha1.reset();
-		for(int i=0;i<k;i++)
-			filter.set(hash.rangeToInt(i*hashBits, hashBits));
+		int needed = hashBits * k;
+		needed = (int) MathUtils.roundToNearestMultiple(MathUtils.ceilDiv(needed, 8), 20);
+		byte[] buffer = new byte[needed];
+		ByteBuffer hashes = ByteBuffer.wrap(buffer);
+		// poor man's SHA1-CTR
+		for(int i=0;i<needed/20;i++) {
+			sha1.update(buf.slice());
+			sha1.update(secret);
+			sha1.update((byte) i);
+			byte[] out = sha1.digest();
+			hashes.put(out);
+			sha1.reset();
+		}
+		return new BitVector(hashBits * k, buffer);
 	}
 	
 	public boolean probablyContains(ByteBuffer data)
 	{
-		MessageDigest sha1 = ThreadLocalUtils.getThreadLocalSHA1();
-		sha1.reset();
-		sha1.update(data);
-		BitVector hash = new BitVector(160, sha1.digest());
-		sha1.reset();
+		BitVector hash = keysForData(data);
 		for(int i=0;i<k;i++)
 		{
 			if(!filter.get(hash.rangeToInt(i*hashBits, hashBits)))
@@ -104,6 +125,12 @@ public class GenericBloomFilter implements Cloneable {
 		return size;
 	}
 	
+	public float estimatedFalsePositiveRate() {
+		//return (float) Math.pow(Math.E,(-((double)m / (double) n) * Math.pow(Math.log(2),2)));
+		return (float) Math.pow(1.0 - Math.pow(Math.E, -k * (double) n / m), k);
+		
+	}
+	
 	// the base for size estimates, occurs in various calculations
 	private double b() {
 		return 1.0 - 1.0 / m;
@@ -116,7 +143,7 @@ public class GenericBloomFilter implements Cloneable {
 	
 	@Override
 	public String toString() {
-		return String.format("bits: %d/%d pop: %d/%d k: %d", filter.bitcount(), filter.size(), populationEstimate(), n, k);
+		return String.format("bits: %d/%d pop: %.2f/%d k: %d", filter.bitcount(), filter.size(), populationEstimate(), n, k);
 	}
 	
 	public static void main(String[] args) throws Exception {

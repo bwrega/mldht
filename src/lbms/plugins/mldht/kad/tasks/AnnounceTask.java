@@ -1,19 +1,8 @@
-/*
- *    This file is part of mlDHT.
- * 
- *    mlDHT is free software: you can redistribute it and/or modify
- *    it under the terms of the GNU General Public License as published by
- *    the Free Software Foundation, either version 2 of the License, or
- *    (at your option) any later version.
- * 
- *    mlDHT is distributed in the hope that it will be useful,
- *    but WITHOUT ANY WARRANTY; without even the implied warranty of
- *    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- *    GNU General Public License for more details.
- * 
- *    You should have received a copy of the GNU General Public License
- *    along with mlDHT.  If not, see <http://www.gnu.org/licenses/>.
- */
+/*******************************************************************************
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ ******************************************************************************/
 package lbms.plugins.mldht.kad.tasks;
 
 import lbms.plugins.mldht.kad.DHTConstants;
@@ -24,10 +13,12 @@ import lbms.plugins.mldht.kad.RPCCall;
 import lbms.plugins.mldht.kad.RPCServer;
 import lbms.plugins.mldht.kad.messages.AnnounceRequest;
 import lbms.plugins.mldht.kad.messages.MessageBase;
+import lbms.plugins.mldht.kad.messages.MessageBase.Method;
 
 import java.util.Map;
 import java.util.NavigableMap;
 import java.util.TreeMap;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * @author Damokles
@@ -37,6 +28,7 @@ public class AnnounceTask extends TargetedTask {
 
 	private int								port;
 	private boolean							isSeed;
+	private AtomicInteger					accepted = new AtomicInteger();
 	
 	NavigableMap<KBucketEntry, byte[]> todo;
 	
@@ -53,7 +45,18 @@ public class AnnounceTask extends TargetedTask {
 	}
 
 	@Override
-	void callFinished (RPCCall c, MessageBase rsp) {}
+	void callFinished (RPCCall c, MessageBase rsp) {
+		if(rsp.getType() != MessageBase.Type.RSP_MSG || rsp.getMethod() != Method.ANNOUNCE_PEER)
+			return;
+		if(!c.matchesExpectedID()) {
+			return;
+		}
+		// strict port check
+		if(!c.getRequest().getDestination().equals(rsp.getOrigin()))
+			return;
+		accepted.incrementAndGet();
+	}
+	
 	@Override
 	void callTimeout (RPCCall c) {}
 	
@@ -101,7 +104,7 @@ public class AnnounceTask extends TargetedTask {
 	
 	@Override
 	protected boolean isDone() {
-		if(getRecvResponses() >= DHTConstants.MAX_ENTRIES_PER_BUCKET)
+		if(accepted.get() >= DHTConstants.MAX_ENTRIES_PER_BUCKET)
 			return true;
 		if(todo.isEmpty() && getNumOutstandingRequests() == 0)
 			return true;
